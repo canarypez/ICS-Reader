@@ -48,6 +48,12 @@ DEFAULTS = {
     "theme": "system",
     # 多轮对话里往回带多少字符的旧消息（超了从最旧的开始丢）
     "history_budget": 12000,
+    # 单次请求的课件上下文总预算，以及各层上限（见 agent.build_context）
+    "context_budget": 16000,
+    "local_page_chars": 6000,
+    "neighbor_summary_chars": 600,
+    "retrieve_chars": 1000,
+    "code_context_chars": 4000,
 }
 
 

@@ -2,14 +2,23 @@
 # Output: dist\ICS-Reader.exe
 $ErrorActionPreference = "Stop"
 
+# Monaco is downloaded on demand and is not committed (see .gitignore).
+if (-not (Test-Path "web\vendor\monaco\vs\loader.js")) {
+  & powershell -NoProfile -ExecutionPolicy Bypass -File "scripts\fetch_monaco.ps1"
+}
+
 pyinstaller --noconfirm --onefile --windowed --clean `
   --name "ICS-Reader" `
   --add-data "web;web" `
   --add-data "stubs;stubs" `
   --add-data "pdf_export.py;." `
+  --add-data "pptx2pdf.ps1;." `
   --collect-all webview `
   --collect-all pythonnet `
   --collect-all clr_loader `
+  --collect-all pypdfium2 `
+  --collect-all pypdfium2_raw `
+  --collect-all pptx `
   --hidden-import clr_loader `
   app.py
 

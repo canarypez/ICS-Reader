@@ -1,0 +1,79 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <meta name="color-scheme" content="light dark" />
+  <title>资料阅读</title>
+  <link rel="stylesheet" href="style.css" />
+</head>
+<body class="docview-body">
+  <main id="stage" class="doc-stage">
+    <div id="page-area" class="doc-page-area">
+      <!-- 连续阅读：所有页从上到下平铺，滚轮就是翻页 -->
+      <div id="scroll-view" class="doc-scroll-view"></div>
+
+      <!-- 单页：一页占满视野 -->
+      <div id="page-box" class="doc-page-box" hidden>
+        <div id="page-canvas" class="doc-page-canvas">
+          <img id="page-img" class="doc-canvas-img" alt="资料页面" />
+          <div id="slide-fit" class="doc-slide-fit doc-canvas-slide" hidden></div>
+          <div id="md-page" class="doc-md-page doc-canvas-md markdown-body" hidden></div>
+          <div id="text-layer" class="doc-text-layer" hidden></div>
+          <div id="image-note" class="doc-image-note" hidden>本页为图片，没有可复制的文字</div>
+        </div>
+      </div>
+
+      <!-- 缩略图总览 -->
+      <div id="tile-grid" class="doc-tile-grid" hidden></div>
+
+      <div id="doc-loading" class="doc-loading">正在加载…</div>
+      <div id="doc-error" class="doc-error" hidden></div>
+    </div>
+  </main>
+
+  <footer class="doc-bar">
+    <button id="btn-prev" type="button" class="doc-nav" aria-label="上一页" title="上一页">‹</button>
+    <span id="page-info" class="doc-page-info">第 0 / 0 页</span>
+    <button id="btn-next" type="button" class="doc-nav" aria-label="下一页" title="下一页">›</button>
+    <input id="page-input" class="doc-page-input" type="number" min="1" inputmode="numeric"
+           aria-label="跳转到页码" title="输入页码后回车" />
+    <div class="spacer"></div>
+
+    <div class="doc-seg" role="group" aria-label="阅读模式">
+      <button id="btn-mode-scroll" type="button" class="doc-btn doc-icon-btn active"
+              aria-label="连续阅读" title="连续阅读">
+        <svg viewBox="0 0 20 20" aria-hidden="true">
+          <rect x="4" y="2.5" width="12" height="4" rx="1"></rect>
+          <rect x="4" y="8" width="12" height="4" rx="1"></rect>
+          <rect x="4" y="13.5" width="12" height="4" rx="1"></rect>
+        </svg>
+      </button>
+      <button id="btn-mode-single" type="button" class="doc-btn doc-icon-btn"
+              aria-label="单页" title="单页">
+        <svg viewBox="0 0 20 20" aria-hidden="true">
+          <rect x="4" y="2.5" width="12" height="15" rx="1.5"></rect>
+        </svg>
+      </button>
+      <button id="btn-mode-tile" type="button" class="doc-btn doc-icon-btn"
+              aria-label="缩略图" title="缩略图">
+        <svg viewBox="0 0 20 20" aria-hidden="true">
+          <rect x="3" y="3" width="6" height="6" rx="1"></rect>
+          <rect x="11" y="3" width="6" height="6" rx="1"></rect>
+          <rect x="3" y="11" width="6" height="6" rx="1"></rect>
+          <rect x="11" y="11" width="6" height="6" rx="1"></rect>
+        </svg>
+      </button>
+    </div>
+
+    <div class="doc-seg" role="group" aria-label="缩放">
+      <button id="btn-zoom-out" type="button" class="doc-btn" aria-label="缩小" title="缩小">−</button>
+      <button id="btn-zoom-fit" type="button" class="doc-btn doc-zoom" title="适应宽度">适应</button>
+      <button id="btn-zoom-in" type="button" class="doc-btn" aria-label="放大" title="放大">＋</button>
+    </div>
+  </footer>
+
+  <script src="mdmini.js"></script>
+  <script src="docview.js"></script>
+</body>
+</html>

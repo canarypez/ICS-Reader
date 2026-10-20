@@ -5,6 +5,14 @@ config.json
 course/
 build/
 
+# 用户上传的资料、课程注册表与上传临时文件
+documents/
+courses/
+tmp/
+
+# 离线代码编辑器资源（scripts/fetch_monaco.ps1 下载）
+web/vendor/monaco/
+
 # Python
 __pycache__/
 *.py[cod]

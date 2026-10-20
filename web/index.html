@@ -4,7 +4,7 @@
   <meta charset="utf-8" />
   <meta name="viewport" content="width=device-width, initial-scale=1" />
   <meta name="color-scheme" content="light dark" />
-  <title>SJTU-ICS</title>
+  <title>ICS-Reader</title>
   <script>
     // 首绘前定好主题，深色下才不会先闪一块白。
     // ?theme= 是 app.py 解析好的结果（「跟随系统」在那边就落地了）；直接开浏览器时没有它，
@@ -21,25 +21,123 @@
   <link rel="stylesheet" href="katex/katex.min.css" />
 </head>
 <body>
-  <header class="topbar">
-    <div class="brand">SJTU-ICS</div>
-    <select id="lecture-select"></select>
-    <button id="btn-update">更新</button>
-    <button id="btn-export">导出 PDF</button>
+  <header class="topbar" hidden>
+    <button id="btn-home" class="brand" type="button" title="返回课程列表">
+      <svg viewBox="0 0 16 16" width="14" height="14" fill="currentColor">
+        <path fill-rule="evenodd" d="M12 8a.5.5 0 0 1-.5.5H5.707l3.147 3.146a.5.5 0 0 1-.708.708l-4-4a.5.5 0 0 1 0-.708l4-4a.5.5 0 1 1 .708.708L5.707 7.5H11.5a.5.5 0 0 1 .5.5z"/>
+      </svg>
+      <span>课程列表</span>
+    </button>
+    <div class="breadcrumb-divider">/</div>
+    <span id="course-title" class="course-title" hidden></span>
+    <select id="course-select" aria-label="课程" hidden>
+      <option value="ics">ICS 课程</option>
+      <option value="docs">我的资料</option>
+    </select>
+    <select id="lecture-select" aria-label="选择讲次或资料"></select>
+    <div class="topbar-actions">
+      <button id="btn-upload" type="button" class="btn-topbar" hidden title="上传资料">
+        <svg viewBox="0 0 16 16" width="13" height="13" fill="currentColor">
+          <path d="M.5 9.9a.5.5 0 0 1 .5.5v2.5a1 1 0 0 0 1 1h12a1 1 0 0 0 1-1v-2.5a.5.5 0 0 1 1 0v2.5a2 2 0 0 1-2 2H2a2 2 0 0 1-2-2v-2.5a.5.5 0 0 1 .5-.5z"/>
+          <path d="M7.646 1.146a.5.5 0 0 1 .708 0l3 3a.5.5 0 0 1-.708.708L8.5 2.707V10.5a.5.5 0 0 1-1 0V2.707L5.354 4.854a.5.5 0 1 1-.708-.708l3-3z"/>
+        </svg>
+        <span>上传资料</span>
+      </button>
+      <button id="btn-delete-doc" type="button" class="btn-topbar danger" hidden title="删除资料">
+        <svg viewBox="0 0 16 16" width="13" height="13" fill="currentColor">
+          <path d="M5.5 5.5A.5.5 0 0 1 6 6v6a.5.5 0 0 1-1 0V6a.5.5 0 0 1 .5-.5zm2.5 0a.5.5 0 0 1 .5.5v6a.5.5 0 0 1-1 0V6a.5.5 0 0 1 .5-.5zm3 .5a.5.5 0 0 0-1 0v6a.5.5 0 0 0 1 0V6z"/>
+          <path fill-rule="evenodd" d="M14.5 3a1 1 0 0 1-1 1H13v9a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2V4h-.5a1 1 0 0 1-1-1V2a1 1 0 0 1 1-1H6a1 1 0 0 1 1-1h2a1 1 0 0 1 1 1h3.5a1 1 0 0 1 1 1v1zM4.118 4 4 4.059V13a1 1 0 0 0 1 1h6a1 1 0 0 0 1-1V4.059L11.882 4H4.118zM2.5 3V2h11v1h-11z"/>
+        </svg>
+        <span>删除资料</span>
+      </button>
+      <button id="btn-update" type="button" class="btn-topbar" hidden title="拉取更新并重新编译">
+        <svg viewBox="0 0 16 16" width="13" height="13" fill="currentColor">
+          <path fill-rule="evenodd" d="M8 3a5 5 0 1 0 4.546 2.914.5.5 0 0 1 .908-.417A6 6 0 1 1 8 2v1z"/>
+          <path d="M8 4.466V.534a.25.25 0 0 1 .41-.192l2.36 1.966c.12.1.12.284 0 .384L8.41 4.658A.25.25 0 0 1 8 4.466z"/>
+        </svg>
+        <span>更新</span>
+      </button>
+      <button id="btn-export" type="button" class="btn-topbar" hidden title="导出当前讲 PDF">
+        <svg viewBox="0 0 16 16" width="13" height="13" fill="currentColor">
+          <path d="M14 14V4.5L9.5 0H4a2 2 0 0 0-2 2v12a2 2 0 0 0 2 2h8a2 2 0 0 0 2-2zM9.5 3A1.5 1.5 0 0 0 11 4.5h2V14a1 1 0 0 1-1 1H4a1 1 0 0 1-1-1V2a1 1 0 0 1 1-1h5.5v2z"/>
+          <path d="M4.603 14.087a.81.81 0 0 1-.438-.42c-.195-.388-.13-.776.08-1.12.228-.372.583-.69 1.054-.928.79-.402 1.833-.67 3.018-.78a16.89 16.89 0 0 1 1.636-.088c.45 0 .82.023 1.11.066.38.057.654.168.805.326.177.185.228.434.143.722-.09.308-.344.577-.732.766-.525.256-1.272.4-2.146.4a23.1 23.1 0 0 1-2.457-.132 11.23 11.23 0 0 1-2.07-.8zm5.728-1.572c-.173 0-.38.01-.61.028a15.82 15.82 0 0 0-1.472.083 18.24 18.24 0 0 0-1.635.19 8.87 8.87 0 0 0-1.39.31c-.322.107-.54.24-.63.388-.066.11-.057.202-.008.272.052.073.155.123.3.14.243.029.585.006 1.002-.07.697-.126 1.56-.37 2.454-.716.488-.19.866-.39 1.1-.57.067-.05.105-.1.109-.144a.2.2 0 0 0-.02-.12c-.04-.07-.12-.12-.3-.15a2.53 2.53 0 0 0-.5-.04z"/>
+        </svg>
+        <span>导出 PDF</span>
+      </button>
+    </div>
     <span id="update-status" class="status"></span>
     <div class="spacer"></div>
-    <button id="btn-settings">⚙ 设置</button>
+    <button id="btn-settings" type="button" class="btn-topbar-settings" title="系统设置">
+      <svg viewBox="0 0 16 16" width="14" height="14" fill="currentColor">
+        <path d="M8 4.754a3.246 3.246 0 1 0 0 6.492 3.246 3.246 0 0 0 0-6.492zM5.754 8a2.246 2.246 0 1 1 4.492 0 2.246 2.246 0 0 1-4.492 0z"/>
+        <path d="M9.796 1.343c-.527-1.79-3.065-1.79-3.592 0l-.094.319a.873.873 0 0 1-1.255.52l-.292-.16c-1.64-.892-3.433.902-2.54 2.541l.159.292a.873.873 0 0 1-.52 1.255l-.319.094c-1.79.527-1.79 3.065 0 3.592l.319.094a.873.873 0 0 1 .52 1.255l-.16.292c-.892 1.64.901 3.434 2.541 2.54l.292-.159a.873.873 0 0 1 1.255.52l.094.319c.527 1.79 3.065 1.79 3.592 0l.094-.319a.873.873 0 0 1 1.255-.52l.292.16c1.64.893 3.434-.902 2.54-2.541l-.159-.292a.873.873 0 0 1 .52-1.255l.319-.094c1.79-.527 1.79-3.065 0-3.592l-.319-.094a.873.873 0 0 1-.52-1.255l.16-.292c.893-1.64-.902-3.433-2.541-2.54l-.292.159a.873.873 0 0 1-1.255-.52l-.094-.319z"/>
+      </svg>
+      <span>设置</span>
+    </button>
   </header>
+  <!-- 浏览器直开（没有 pywebview 原生文件对话框）时的上传入口 -->
+  <input id="file-input" type="file" multiple accept=".pdf,.pptx,.md,application/pdf,application/vnd.openxmlformats-officedocument.presentationml.presentation,text/markdown" hidden />
 
-  <main class="layout">
+  <!-- 课程首页 -->
+  <main id="home-view" class="home-view">
+    <div class="home-head">
+      <div class="home-title-block">
+        <h1>我的课程</h1>
+        <p class="hint">本地与导入的课件、代码仓库与课程资料。</p>
+      </div>
+      <div class="home-actions">
+        <button id="btn-home-settings" type="button" class="btn-topbar-settings" title="系统设置">
+          <svg viewBox="0 0 16 16" width="14" height="14" fill="currentColor">
+            <path d="M8 4.754a3.246 3.246 0 1 0 0 6.492 3.246 3.246 0 0 0 0-6.492zM5.754 8a2.246 2.246 0 1 1 4.492 0 2.246 2.246 0 0 1-4.492 0z"/>
+            <path d="M9.796 1.343c-.527-1.79-3.065-1.79-3.592 0l-.094.319a.873.873 0 0 1-1.255.52l-.292-.16c-1.64-.892-3.433.902-2.54 2.541l.159.292a.873.873 0 0 1-.52 1.255l-.319.094c-1.79.527-1.79 3.065 0 3.592l.319.094a.873.873 0 0 1 .52 1.255l-.16.292c-.892 1.64.901 3.434 2.541 2.54l.292-.159a.873.873 0 0 1 1.255.52l.094.319c.527 1.79 3.065 1.79 3.592 0l.094-.319a.873.873 0 0 1 1.255-.52l.292.16c1.64.893 3.434-.902 2.54-2.541l-.159-.292a.873.873 0 0 1 .52-1.255l.319-.094c1.79-.527 1.79-3.065 0-3.592l-.319-.094a.873.873 0 0 1-.52-1.255l.16-.292c.893-1.64-.902-3.433-2.541-2.54l-.292.159a.873.873 0 0 1-1.255-.52l-.094-.319z"/>
+          </svg>
+          <span>设置</span>
+        </button>
+        <button id="btn-add-course" type="button" class="primary btn-add-course" hidden>
+          <svg viewBox="0 0 16 16" width="14" height="14" fill="currentColor">
+            <path d="M8 2a.75.75 0 0 1 .75.75v4.5h4.5a.75.75 0 0 1 0 1.5h-4.5v4.5a.75.75 0 0 1-1.5 0v-4.5h-4.5a.75.75 0 0 1 0-1.5h4.5v-4.5A.75.75 0 0 1 8 2z"/>
+          </svg>
+          <span>添加课程</span>
+        </button>
+      </div>
+    </div>
+    <div id="course-cards" class="course-cards"></div>
+    <div id="home-empty" class="home-empty" hidden>
+      <div class="home-empty-visual">
+        <svg viewBox="0 0 48 48" width="48" height="48" fill="none" stroke="currentColor" stroke-width="1.6" stroke-linecap="round" stroke-linejoin="round">
+          <path d="M4 10a4 4 0 0 1 4-4h10l6 6h16a4 4 0 0 1 4 4v20a4 4 0 0 1-4 4H8a4 4 0 0 1-4-4V10z"></path>
+          <line x1="24" y1="22" x2="24" y2="34"></line>
+          <line x1="18" y1="28" x2="30" y2="28"></line>
+        </svg>
+      </div>
+      <h3>暂无课程</h3>
+      <p>点击右上角「添加课程」导入课件或资料。</p>
+    </div>
+  </main>
+
+  <main id="work-view" class="layout" hidden>
     <section class="deck">
       <!-- 用 aria-label 而不是 title：iframe 上的 title 在部分浏览器里会飘出黑框提示 -->
       <iframe id="viewer" src="about:blank" aria-label="课件"></iframe>
-      <div id="deck-empty" class="empty">正在加载课件…（首次使用请先点「更新」）</div>
+      <div id="deck-empty" class="empty">
+        <div class="deck-empty-inner">
+          <div class="deck-spinner"></div>
+          <span>加载中…</span>
+        </div>
+      </div>
+      <!-- 切换课程 / 讲次时的缓冲层：先盖住旧画面，等 iframe 真正 load 再淡出 -->
+      <div id="deck-loading" class="deck-loading" aria-live="polite">
+        <div class="deck-loading-card">
+          <div class="deck-spinner"></div>
+          <span id="deck-loading-text">正在加载…</span>
+        </div>
+      </div>
     </section>
 
     <div id="chat-resizer" class="chat-resizer" role="separator" aria-orientation="vertical"
-         aria-label="调整侧栏宽度"></div>
+         aria-label="调整侧栏宽度">
+      <div class="resizer-handle"></div>
+    </div>
 
     <aside class="chat">
       <div class="chat-head">
@@ -48,13 +146,13 @@
           <button type="button" class="tab" data-mode="search" role="tab">检索</button>
         </div>
         <div class="spacer"></div>
-        <button type="button" id="btn-history" class="ghost">历史</button>
+        <button type="button" id="btn-history" class="ghost" title="查看会话历史">历史</button>
       </div>
       <!-- 历史：非模态小浮层。对话按讲分，所以这里只列当前讲的那一份 -->
       <div id="history-pop" class="history-pop" hidden>
         <div class="hist-head">
-          <span class="hist-cap">历史对话</span>
-          <button type="button" id="btn-new-conv" class="ghost">新对话</button>
+          <span class="hist-cap">会话历史</span>
+          <button type="button" id="btn-new-conv" class="ghost">新会话</button>
         </div>
         <div id="history-list" class="hist-list"></div>
       </div>
@@ -62,13 +160,18 @@
       <div id="messages" class="messages"></div>
       <div id="results" class="results" hidden></div>
       <form id="chat-form" class="chat-input">
-        <select id="search-scope" class="scope" hidden>
-          <option value="lecture">本讲</option>
-          <option value="all">全部</option>
-        </select>
-        <div class="input-row">
-          <textarea id="question" rows="2" placeholder="问问AI助手"></textarea>
-          <button type="submit" id="btn-send" class="icon" aria-label="发送">↑</button>
+        <div class="chat-input-controls">
+          <select id="search-scope" class="scope" hidden>
+            <option value="lecture">本讲</option>
+            <option value="all">全部</option>
+          </select>
+        </div>
+        <div class="input-card">
+          <textarea id="question" rows="2" placeholder="输入问题（Enter 发送，Shift + Enter 换行）"></textarea>
+          <div class="input-actions">
+            <span class="input-tip">Enter 发送</span>
+            <button type="submit" id="btn-send" class="icon" aria-label="发送">↑</button>
+          </div>
         </div>
       </form>
     </aside>
@@ -135,6 +238,52 @@
         <button type="button" id="btn-wizard-dismiss">不再提示缺失项</button>
         <div class="spacer"></div>
         <button type="button" id="btn-wizard-close" class="primary">关闭</button>
+      </div>
+    </div>
+  </dialog>
+
+  <dialog id="import-modal">
+    <div class="modal import-modal">
+      <h3 id="import-title">添加课程</h3>
+      <div class="import-tabs" role="tablist">
+        <button type="button" class="tab active" data-import-tab="files" role="tab">文件</button>
+        <button type="button" class="tab" data-import-tab="repo" role="tab">仓库 / LectureKit</button>
+      </div>
+
+      <section id="import-files" class="import-pane">
+        <div id="drop-zone" class="drop-zone">
+          <div class="drop-icon">⬆</div>
+          <div>把 PDF、PPTX、Markdown 拖到这里</div>
+          <div class="hint">或 <button id="btn-pick-files" type="button" class="link-btn">选择文件</button>（可多选）</div>
+        </div>
+        <ul id="import-file-list" class="import-file-list"></ul>
+        <label>课程名称
+          <input id="import-file-course" placeholder="留空则放进「我的资料」" />
+        </label>
+        <div id="import-file-status" class="import-status"></div>
+      </section>
+
+      <section id="import-repo" class="import-pane" hidden>
+        <label>本地路径或 Git 地址
+          <input id="import-repo-source" placeholder="D:\CSAPP\OS-Course 或 https://github.com/..." />
+        </label>
+        <label>课程名称
+          <input id="import-repo-title" placeholder="留空则用目录名" />
+        </label>
+        <div class="row">
+          <button id="btn-repo-scan" type="button">扫描预览</button>
+          <label class="inline"><input id="import-with-decks" type="checkbox" checked /> 同时导入 PDF/PPTX/MD</label>
+        </div>
+        <div id="repo-scan-result" class="scan-result" hidden></div>
+        <div id="repo-warning" class="repo-warning" hidden>
+          ⚠ 仓库里有 lecture.py，导入时会用当前用户权限执行仓库代码来渲染课件。
+        </div>
+        <div id="repo-log" class="job-log" hidden></div>
+      </section>
+
+      <div class="modal-actions">
+        <button type="button" id="btn-import-cancel">取消</button>
+        <button type="button" id="btn-import-start" class="primary">开始导入</button>
       </div>
     </div>
   </dialog>

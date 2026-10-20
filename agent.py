@@ -36,6 +36,23 @@ DEFAULT_SYSTEM = (
     "6. 用中文回答，条理清晰、重点突出，篇幅适中。"
 )
 
+#: 用户自己上传资料（PDF / PPTX）时用的 system prompt。和 ICS 助教分开：资料不一定是
+#: 计算机课，而且扫描件常常抽不出文字，得允许模型结合图片/前后页来推断。
+DOC_SYSTEM = (
+    "你是一个善于读讲义的学习助手，正在陪学生读他自己上传的课程资料（PDF 或幻灯片）。\n"
+    "下面会给你一段资料上下文：学生「正在看的那一页」的全文、它前后的页、"
+    "这份资料各页的标题和页码，以及按问题关键词在这份资料里检索到的相关页。\n"
+    "要求：\n"
+    "1. 优先依据这些资料回答，能结合前后页和整份资料的结构来解释，而不是只看当前一页；\n"
+    "2. 学生可能刚接触这个主题，讲清楚直觉和来龙去脉，必要时给例子；\n"
+    "3. 如果资料里不足以回答，明确说明「这份资料里没有直接讲」，再基于你自己的知识补充；\n"
+    "4. 不要编造资料里不存在的页码、公式或结论；\n"
+    "5. 如果当前页是可提取文字为空的扫描页/图片页，结合标题、前后页和你的知识来讲解，"
+    "并说明这一点；\n"
+    "6. 数学公式一律用 LaTeX：行内用 $...$、独立成行用 $$...$$，方便前端渲染；\n"
+    "7. 用中文回答，条理清晰、重点突出，篇幅适中。"
+)
+
 
 # --------------------------------------------------------------------------- 文本抽取
 def _flatten_strings(obj, out):
@@ -57,13 +74,24 @@ def page_to_text(page: dict) -> str:
         lines.append(title)
     for b in page.get("blocks", []):
         kind = b.get("kind")
-        if kind in ("cover", "image", "spacer", "row"):
+        # row 是分栏容器，content 里还有子 blocks。以前整块跳过，双栏页的一半文字
+        # 就这么从检索和上下文里消失了。
+        if kind in ("cover", "image", "spacer"):
             continue
         strs = []
-        _flatten_strings(b.get("content"), strs)
+        if kind == "row" and isinstance(b.get("content"), (list, tuple)):
+            nested = []
+            for sub in b.get("content") or []:
+                if isinstance(sub, dict):
+                    _flatten_strings(sub.get("content"), nested)
+                else:
+                    _flatten_strings(sub, nested)
+            strs = nested
+        else:
+            _flatten_strings(b.get("content"), strs)
         text = " ".join(s.strip() for s in strs if s and s.strip())
-        if kind == "code" and len(text) > 600:
-            text = text[:600]
+        if kind == "code" and len(text) > 1200:
+            text = text[:1200]
         if text:
             lines.append(text)
     return "\n".join(lines)
@@ -77,43 +105,60 @@ class CourseStore:
         self.lectures = {}
         self.reload()
 
+    def load_lecture(self, build_dir, lid, base=None, course_id="ics", vid=None,
+                     kind="ics"):
+        """读一个 lecture.json，返回扁平 `lectures` 里的一项。
+
+        `lid` 是全局唯一的讲/资料 id。ICS 目录名保持不变（历史文件名、sessionStorage
+        键都靠它）；仓库课程用 `<course_id>:<目录名>`，免得两个仓库里同名的
+        `01-intro` 互相覆盖。
+        """
+        lj = os.path.join(build_dir, "lecture.json")
+        if not os.path.isfile(lj):
+            return None
+        try:
+            with open(lj, "r", encoding="utf-8") as f:
+                data = json.load(f)
+        except Exception:
+            return None
+        name = os.path.basename(os.path.normpath(build_dir))
+        title = (data.get("lecture") or {}).get("title") or name
+        pages = data.get("pages", [])
+        page_text = {}
+        page_number = {}
+        page_title = {}
+        for i, p in enumerate(pages):
+            pid = p.get("id")
+            page_text[pid] = page_to_text(p)
+            # number 是「幻灯片上印出来的页码」，会因过渡页重复，只可用于展示；
+            # 要跳转 / 当下标一律用页在 pages 里的位置（page_index）。
+            page_number[pid] = p.get("number") or (i + 1)
+            page_title[pid] = p.get("title") or ""
+        return {
+            "dir": lid,
+            "kind": kind,
+            "course_id": course_id,
+            "base": base or f"/lectures/{lid}/",
+            # 阅读器外壳自己的讲 id（如 ics-intro，与目录名 1-intro 不同）。
+            # 前端跳页要靠它拼 sessionStorage 的键，所以得透出去。
+            "vid": vid or (data.get("lecture") or {}).get("id") or name,
+            "title": title,
+            "tree": data.get("tree", []),
+            "pages": pages,
+            "page_text": page_text,
+            "page_number": page_number,
+            "page_title": page_title,
+        }
+
     def reload(self):
         self.lectures = {}
         if not os.path.isdir(self.build_root):
             return
         for name in sorted(os.listdir(self.build_root)):
-            lj = os.path.join(self.build_root, name, "lecture.json")
-            if not os.path.isfile(lj):
-                continue
-            try:
-                with open(lj, "r", encoding="utf-8") as f:
-                    data = json.load(f)
-            except Exception:
-                continue
-            title = (data.get("lecture") or {}).get("title") or name
-            pages = data.get("pages", [])
-            page_text = {}
-            page_number = {}
-            page_title = {}
-            for i, p in enumerate(pages):
-                pid = p.get("id")
-                page_text[pid] = page_to_text(p)
-                # number 是「幻灯片上印出来的页码」，会因过渡页重复，只可用于展示；
-                # 要跳转 / 当下标一律用页在 pages 里的位置（page_index）。
-                page_number[pid] = p.get("number") or (i + 1)
-                page_title[pid] = p.get("title") or ""
-            self.lectures[name] = {
-                "dir": name,
-                # 阅读器外壳自己的讲 id（如 ics-intro，与目录名 1-intro 不同）。
-                # 前端跳页要靠它拼 sessionStorage 的键，所以得透出去。
-                "vid": (data.get("lecture") or {}).get("id") or name,
-                "title": title,
-                "tree": data.get("tree", []),
-                "pages": pages,
-                "page_text": page_text,
-                "page_number": page_number,
-                "page_title": page_title,
-            }
+            entry = self.load_lecture(os.path.join(self.build_root, name), name,
+                                      base=f"/lectures/{name}/", course_id="ics")
+            if entry:
+                self.lectures[name] = entry
 
     def lecture_ids(self):
         return list(self.lectures.keys())
@@ -129,13 +174,32 @@ class CourseStore:
                 lines.append("  " * depth + "- " + (node.get("title") or ""))
         return lines
 
-    def course_map_text(self):
+    def course_map_text(self, kind=None, course_id=None):
+        """整门课 / 整份资料的结构。kind='ics' 只看课件，'doc' 只看上传的资料。
+
+        资料和课件现在住在同一个 `lectures` 字典里，所以这里必须能筛。ICS 的编号
+        也依赖筛选后的顺序 —— 不筛的话，用户传的资料会把「第几讲」全挤乱。
+        `course_id` 再把范围收窄到某一门课。
+        """
         lines = []
-        for i, lid in enumerate(self.lecture_ids(), 1):
+        n = 0
+        for lid in self.lecture_ids():
             lec = self.lectures[lid]
-            lines.append(f"第{i}讲《{lec['title']}》")
+            if kind and lec.get("kind") != kind:
+                continue
+            if course_id and lec.get("course_id") != course_id:
+                continue
+            if lec.get("kind") == "doc":
+                lines.append(f"《{lec['title']}》（共 {len(lec['pages'])} 页）")
+            else:
+                n += 1
+                lines.append(f"第{n}讲《{lec['title']}》")
             lines.extend(self._outline_text(lec["tree"], 1))
-        return "\n".join(lines) if lines else "（暂无课件，先点右上角「更新」渲染）"
+        if lines:
+            return "\n".join(lines)
+        if kind == "doc":
+            return "（还没有上传资料）"
+        return "（暂无课件，先点右上角「更新」渲染）"
 
     def outline_text(self, lid):
         lec = self.lectures.get(lid)
@@ -173,10 +237,16 @@ class CourseStore:
             return 0.0
         return s / (max(length, _MIN_SCORE_LEN) ** 0.5)
 
-    def _rank(self, tokens, lid_filter=None, boost_lid=None):
+    def _rank(self, tokens, lid_filter=None, boost_lid=None, kind=None,
+              course_id=None):
         """所有页的打分，降序。retrieve 与 search 共用，避免两套逻辑。"""
         out = []
-        lids = [lid_filter] if lid_filter in self.lectures else self.lecture_ids()
+        if lid_filter in self.lectures:
+            lids = [lid_filter]
+        else:
+            lids = [lid for lid in self.lecture_ids()
+                    if (not kind or self.lectures[lid].get("kind") == kind) and
+                    (not course_id or self.lectures[lid].get("course_id") == course_id)]
         for lid in lids:
             lec = self.lectures[lid]
             boost = 1.25 if lid == boost_lid else 1.0   # 当前讲降权改为加权
@@ -187,12 +257,73 @@ class CourseStore:
         out.sort(key=lambda x: -x[0])
         return out
 
-    def retrieve(self, question, boost_lid=None, exclude=None, k=4):
-        """给 LLM 用的相关页。exclude 是 (lid, pid)：当前页已单独进上下文，不必重复。"""
+    def _fts_ranked(self, query, lid_filter=None, kind=None, course_id=None,
+                    limit=60):
+        """FTS5 候选，映射成 (score, lid, pid)。没有索引/没课程时返回空。
+
+        FTS5 的 bm25 分数量级和旧的子串打分不可比，所以这里只取**排序名次**，
+        归一成 1.0 → 0.0；混合比例交给 _combined_rank。
+        """
+        idx = getattr(self, "index", None)
+        if idx is None:
+            return []
+        cid = course_id
+        if not cid and lid_filter in self.lectures:
+            cid = self.lectures[lid_filter].get("course_id")
+        if not cid:
+            return []
+        try:
+            cands = idx.pages(cid, query, limit=limit)
+        except Exception:
+            return []
+        out = []
+        n = max(1, len(cands))
+        for i, c in enumerate(cands):
+            lid, pid = c.get("lid"), c.get("page")
+            lec = self.lectures.get(lid)
+            if not lec:
+                continue
+            if lid_filter and lid != lid_filter:
+                continue
+            if kind and lec.get("kind") != kind:
+                continue
+            if course_id and lec.get("course_id") != course_id:
+                continue
+            out.append((1.0 - i / n, lid, pid))
+        return out
+
+    def _combined_rank(self, query, tokens, lid_filter=None, boost_lid=None,
+                       kind=None, course_id=None):
+        legacy = self._rank(tokens, lid_filter=lid_filter, boost_lid=boost_lid,
+                            kind=kind, course_id=course_id)
+        fts = self._fts_ranked(query, lid_filter=lid_filter, kind=kind,
+                               course_id=course_id)
+        if not fts:
+            return legacy
+        top = max((s for s, _l, _p in legacy), default=0.0) or 1.0
+        merged = {}
+        for s, lid, pid in legacy:
+            merged[(lid, pid)] = 0.3 * (s / top)
+        for s, lid, pid in fts:
+            merged[(lid, pid)] = merged.get((lid, pid), 0.0) + 0.7 * s
+        out = [(s, lid, pid) for (lid, pid), s in merged.items() if s > 0]
+        out.sort(key=lambda x: -x[0])
+        return out
+
+    def retrieve(self, question, boost_lid=None, exclude=None, k=4,
+                 lid_filter=None, kind=None, course_id=None):
+        """给 LLM 用的相关页。exclude 是 (lid, pid)：当前页已单独进上下文，不必重复。
+
+        `lid_filter` 把检索限制在一份资料/一讲里 —— 读用户上传的 PDF 时，绝不能把
+        ICS 课件里的页混进「这份资料的相关页」。`kind` 则是反向的：读 ICS 时用它
+        把用户资料排除在外，同时仍允许跨讲检索。
+        """
         toks = self._tokenize(question)
         if not toks:
             return []
-        ranked = self._rank(toks, boost_lid=boost_lid)
+        ranked = self._combined_rank(question, toks, lid_filter=lid_filter,
+                                     boost_lid=boost_lid, kind=kind,
+                                     course_id=course_id)
         res = []
         for s, lid, pid in ranked:
             if exclude and (lid, pid) == tuple(exclude):
@@ -202,7 +333,7 @@ class CourseStore:
                 break
         return res
 
-    def search(self, query, lid=None, k=20):
+    def search(self, query, lid=None, k=20, kind=None, course_id=None):
         """用户直接搜关键词：返回可点击的结果（含可跳转的下标与展示用页码）。
 
         同一张逻辑页会因为动画分步而对应多张幻灯片（3-asm：162 张幻灯片只印 67 页），
@@ -214,7 +345,8 @@ class CourseStore:
             return []
         out = []
         seen = set()
-        for s, L, pid in self._rank(toks, lid_filter=lid):
+        for s, L, pid in self._combined_rank(query, toks, lid_filter=lid,
+                                             kind=kind, course_id=course_id):
             lec = self.lectures[L]
             num = lec["page_number"].get(pid)
             ptitle = lec["page_title"].get(pid, "")
@@ -226,6 +358,8 @@ class CourseStore:
             out.append({
                 "lecture": L,
                 "vid": lec["vid"],
+                "kind": lec.get("kind") or "ics",
+                "course_id": lec.get("course_id") or "ics",
                 "lecture_title": lec["title"],
                 "page": pid,
                 "index": self.page_index(L, pid),          # 0-based，前端跳转用
@@ -281,47 +415,227 @@ class CourseStore:
 
 
 # --------------------------------------------------------------------------- 上下文
-def build_context(store: CourseStore, lid, pid, question, max_retrieve):
+#: 三级路由的关键词。宁可把「函数怎么写」误判成代码联动，也别把「这次 lab 的模板
+#: 在哪个文件」漏成局部答疑。
+_CODE_HINTS = (
+    "lab", "实验", "测试", "模板", "函数", "头文件", "实现", "调用", "源码", "代码",
+    "starter", "test", "makefile", "编译", "链接", "系统调用", "汇编",
+)
+_COURSE_HINTS = (
+    "哪一讲", "哪一页", "哪一次", "哪章", "哪份", "前面", "之前", "此前", "上次",
+    "整个课程", "全课程", "所有讲", "复习", "总结", "贯穿", "在哪", "讲过", "联系",
+    "关系", "对比", "比较",
+)
+
+
+def route_question(question: str, code=None) -> str:
+    if code:
+        return "code"
+    q = str(question or "").lower()
+    if any(h in q for h in _CODE_HINTS):
+        return "code"
+    if any(h in q for h in _COURSE_HINTS):
+        return "course"
+    return "local"
+
+
+def _clip(text: str, limit: int) -> str:
+    text = str(text or "")
+    if len(text) <= limit:
+        return text
+    return text[:max(0, limit)].rstrip() + "\n…（已截断）"
+
+
+def _trim_page(text: str, limit: int) -> str:
+    """当前页太长时保留开头、公式/代码行和结尾 —— 中间通常是重复的正文。
+
+    直接截前 N 字会把结论和底部注释全丢掉；保留「关键行」能救回大部分信息。
+    """
+    text = str(text or "")
+    if len(text) <= limit:
+        return text
+    lines = text.split("\n")
+    key = [ln for ln in lines
+           if re.search(r"[=≈≠≤≥∑∫√]|\\\\|\b(def|class|int|void|for|while|if)\b", ln)]
+    head = text[: int(limit * 0.62)]
+    tail = text[-int(limit * 0.12):]
+    mid = "\n".join(key)
+    budget = max(0, limit - len(head) - len(tail) - 40)
+    if mid:
+        mid = mid[:budget]
+    return head + ("\n…\n【公式/代码行】\n" + mid if mid else "") + \
+        "\n…\n" + tail + "\n（本页较长，已按优先级截断）"
+
+
+def _page_summary(store, lid, pid, limit=600):
+    """相邻页只给「标题 + 第一段 + 公式/代码行」，不再整页塞进去。"""
+    lec = store.lectures.get(lid) or {}
+    text = lec.get("page_text", {}).get(pid, "")
+    title = lec.get("page_title", {}).get(pid, "")
+    paras = [p.strip() for p in re.split(r"\n\s*\n|\n", text) if p.strip()]
+    first = paras[0] if paras else ""
+    key = [ln for ln in text.split("\n")
+           if re.search(r"[=≈≠≤≥∑∫√]|\\\\|\b(def|class|int|void|for|while)\b", ln)][:4]
+    body = first
+    if key:
+        body += "\n" + "\n".join(key)
+    return _clip((title + "\n" if title else "") + body, limit)
+
+
+def _doc_notes(lec, pid):
+    for p in lec.get("pages") or []:
+        if p.get("id") == pid:
+            return p.get("notes") or ""
+    return ""
+
+
+def _assemble(parts, budget):
+    """按优先级装配：0=当前页，1=检索，2=相邻页。超预算依次丢 2、压 1、截 0。"""
+    parts = [(int(p), str(t)) for p, t in parts if str(t or "").strip()]
+    used = sum(len(t) for _p, t in parts)
+
+    def drop_priority(pr):
+        nonlocal used
+        keep = []
+        for p, t in parts:
+            if p == pr:
+                used -= len(t)
+            else:
+                keep.append((p, t))
+        parts[:] = keep
+
+    def shrink(pr, limit):
+        nonlocal used
+        for i, (p, t) in enumerate(parts):
+            if p == pr and len(t) > limit:
+                used -= len(t) - limit
+                parts[i] = (p, _clip(t, limit))
+
+    if used > budget:
+        drop_priority(2)
+    if used > budget:
+        shrink(1, 500)
+    if used > budget:
+        shrink(1, 300)
+    if used > budget:
+        # 当前页是最后保留的：只截它，不删
+        for i, (p, t) in enumerate(parts):
+            if p == 0:
+                allow = max(1200, budget - (used - len(t)))
+                parts[i] = (p, _trim_page(t, allow))
+                break
+    return "\n\n".join(t for _p, t in parts)
+
+
+def build_context(store: CourseStore, lid, pid, question, max_retrieve,
+                  course_id=None, route=None, code=None, config=None):
+    config = config or {}
     lec = store.lectures.get(lid)
+    cid = course_id or (lec or {}).get("course_id") or "ics"
+    route = route or route_question(question, code)
+    budget = int(config.get("context_budget", 16000))
+    p0_limit = int(config.get("local_page_chars", 6000))
+    p2_limit = int(config.get("neighbor_summary_chars", 600))
+    p1_limit = int(config.get("retrieve_chars", 1000))
+    code_limit = int(config.get("code_context_chars", 4000))
+
     parts = []
 
-    parts.append("【整门课全貌】\n" + store.course_map_text())
-
+    # ---- 课程地图 / 大纲：永远保留，但也要收着点
+    if cid == "ics":
+        parts.append((1, _clip("【整门课全貌】\n" + store.course_map_text(
+            kind="ics", course_id=cid), 5000)))
+    else:
+        parts.append((1, _clip("【本课程结构】\n" + store.course_map_text(
+            course_id=cid), 4000)))
     if lec:
-        parts.append(f"【当前讲《{lec['title']}》大纲】\n" + store.outline_text(lid))
+        parts.append((1, _clip(
+            f"【当前{'资料' if lec.get('kind') == 'doc' else '讲'}《{lec['title']}》"
+            f"目录】\n" + ("\n".join(store._outline_text(lec["tree"]))[:2500]),
+            3000)))
 
-        idx = store.page_index(lid, pid)
-        if idx is not None:
-            pages = lec["pages"]
-            # 当前页
-            cur_title = pages[idx].get("title")
-            cur_num = pages[idx].get("number") or (idx + 1)
-            parts.append(
-                f"【学生正在看：第 {cur_num} 页《{cur_title}》— 全文】\n"
-                + lec["page_text"].get(pid, "")
-            )
-            # 前后页
-            for off, label in ((-1, "上一页"), (1, "下一页")):
-                j = idx + off
-                if 0 <= j < len(pages):
-                    pj = pages[j]
-                    t = lec["page_text"].get(pj.get("id"), "")
-                    if t:
-                        parts.append(f"【{label}《{pj.get('title')}》】\n" + t)
+    # ---- P0 当前页
+    idx = store.page_index(lid, pid) if lec else None
+    if lec and idx is not None:
+        pages = lec["pages"]
+        cur = pages[idx]
+        cur_num = cur.get("number") or (idx + 1)
+        cur_title = cur.get("title") or ""
+        body = lec["page_text"].get(pid, "")
+        if not body.strip():
+            body = ("（这一页没有可提取的文字，可能是扫描图片或纯图片幻灯片；"
+                    "请结合标题、相邻页和常识讲解。）")
+        notes = _doc_notes(lec, pid) if lec.get("kind") == "doc" else ""
+        if notes:
+            body += "\n\n【演讲者备注】\n" + notes
+        label = "页" if lec.get("kind") == "doc" else "页"
+        parts.append((0, _trim_page(
+            f"【学生正在看：第 {cur_num} {label}《{cur_title}》— 全文】\n" + body,
+            p0_limit)))
 
-    # 不再排除当前讲：一门讲上百页时，真正相关的那页可能离当前页很远，只靠前后页够不着。
-    # 改为给当前讲加权，并跳过当前页本身（它已在上面的「正在看」里全文给出）。
-    rel = store.retrieve(question, boost_lid=lid, exclude=(lid, pid), k=max_retrieve)
-    if rel:
-        parts.append("【按问题检索到的相关页】")
-        for s, rlid, rpid, rtitle in rel:
-            rlec = store.lectures[rlid]
-            t = rlec["page_text"].get(rpid, "")
-            num = rlec["page_number"].get(rpid, "?")     # 印刷页码，学生看到的是这个
-            rtitle2 = rlec["page_title"].get(rpid) or ""
-            parts.append(f"— 《{rtitle}》第 {num} 页《{rtitle2}》：\n{t[:500]}")
+    # ---- P1 检索
+    if lec:
+        if route == "course":
+            rel = store.retrieve(question, boost_lid=lid, exclude=(lid, pid),
+                                 k=max(2, max_retrieve), course_id=cid,
+                                 kind=lec.get("kind"))
+        elif lec.get("kind") == "doc":
+            rel = store.retrieve(question, boost_lid=lid, exclude=(lid, pid),
+                                 k=min(2, max_retrieve), lid_filter=lid)
+        else:
+            rel = store.retrieve(question, boost_lid=lid, exclude=(lid, pid),
+                                 k=min(2, max_retrieve), course_id=cid, kind="ics")
+        if rel:
+            lines = ["【按问题检索到的相关页】"]
+            for _s, rlid, rpid, rtitle in rel:
+                rlec = store.lectures.get(rlid) or {}
+                t = rlec.get("page_text", {}).get(rpid, "")
+                num = rlec.get("page_number", {}).get(rpid, "?")
+                rt = rlec.get("page_title", {}).get(rpid) or ""
+                lines.append(f"— 《{rtitle}》第 {num} 页《{rt}》：\n"
+                             + _clip(t, p1_limit))
+            parts.append((1, "\n".join(lines)))
 
-    return "\n\n".join(parts)
+    # ---- P2 相邻页（只给摘要）
+    if lec and idx is not None:
+        for off, label in ((-1, "上一页"), (1, "下一页")):
+            j = idx + off
+            if 0 <= j < len(lec["pages"]):
+                p = lec["pages"][j]
+                if p.get("id"):
+                    parts.append((2, f"【{label}摘要】\n" + _page_summary(
+                        store, lid, p["id"], p2_limit)))
+
+    # ---- 代码联动
+    if code and isinstance(code, dict):
+        cpath = str(code.get("path") or "")
+        ctext = str(code.get("text") or "")
+        start, end = code.get("start"), code.get("end")
+        lines = [f"【学生选中的代码：{cpath}" +
+                 (f" 第 {start}-{end} 行" if start else "") + "】",
+                 "```" + str(code.get("lang") or ""), _clip(ctext, code_limit), "```"]
+        idxobj = getattr(store, "index", None)
+        cid2 = course_id or cid
+        if idxobj is not None and cid2:
+            try:
+                hits = idxobj.code(cid2, " ".join(re.findall(
+                    r"[A-Za-z_][A-Za-z0-9_]{2,}", ctext)[:12]), limit=4)
+            except Exception:
+                hits = []
+            if hits:
+                lines.append("【课程仓库里可能相关的实现 / 测试】")
+                for h in hits[:3]:
+                    if h["path"] == cpath:
+                        continue
+                    lines.append(f"— {h['path']}：\n```\n"
+                                 + _clip(h.get("text") or "", code_limit // 3) + "\n```")
+        parts.append((0, _clip("\n".join(lines), code_limit + 800)))
+
+    if lec and lec.get("kind") == "doc":
+        parts.append((1, "【提示】这是学生自己上传的资料，不是 ICS 课件；"
+                        "回答时不要把它当成 ICS 课程内容，也不要用 ICS 的讲次编号。"))
+
+    return _assemble(parts, budget)
 
 
 def _history_messages(history, budget):
@@ -350,14 +664,24 @@ def _history_messages(history, budget):
     return turns
 
 
-def build_messages(config: dict, store: CourseStore, lid, pid, question, history=None):
+def build_messages(config: dict, store: CourseStore, lid, pid, question, history=None,
+                   course_id=None, code=None, route=None):
     """拼这次请求的消息列表。一次性问答与流式共用 —— 两处各写一份 prompt 迟早走偏。
 
     课件上下文只跟着「这一问」走，不进历史：它每轮都得按当时的页重新拼，存进历史既会
     反复撑大请求，也会在用户翻页之后拿旧页的全文去骗模型。
     """
-    ctx = build_context(store, lid, pid, question, int(config.get("max_retrieve", 4)))
-    msgs = [{"role": "system", "content": config.get("system_prompt") or DEFAULT_SYSTEM}]
+    route = route or route_question(question, code)
+    ctx = build_context(store, lid, pid, question,
+                        int(config.get("max_retrieve", 4)),
+                        course_id=course_id, route=route, code=code, config=config)
+    lec = store.lectures.get(lid)
+    if lec and lec.get("kind") == "doc":
+        # 自定义 system prompt 是给 ICS 助教调口味用的；资料不一定是 ICS，别硬套。
+        system = DOC_SYSTEM
+    else:
+        system = config.get("system_prompt") or DEFAULT_SYSTEM
+    msgs = [{"role": "system", "content": system}]
     msgs.extend(_history_messages(history, int(config.get("history_budget", 12000))))
     msgs.append({"role": "user", "content": ctx + "\n\n【学生的问题】\n" + question})
     return msgs
@@ -556,11 +880,13 @@ def _require(config: dict):
         raise RuntimeError("未配置 API Key，请在「设置」里填写。")
 
 
-def ask(config: dict, store: CourseStore, lid, pid, question, history=None):
+def ask(config: dict, store: CourseStore, lid, pid, question, history=None,
+        course_id=None, code=None, route=None):
     _require(config)
     payload = {
         "model": (config.get("model") or "deepseek-chat").strip(),
-        "messages": build_messages(config, store, lid, pid, question, history),
+        "messages": build_messages(config, store, lid, pid, question, history,
+                                   course_id=course_id, code=code, route=route),
         "stream": False,
         "temperature": 0.3,
     }
@@ -650,7 +976,8 @@ def _iter_deltas(resp):
             yield text
 
 
-def stream_chat(config: dict, store: CourseStore, lid, pid, question, history=None):
+def stream_chat(config: dict, store: CourseStore, lid, pid, question, history=None,
+                course_id=None, code=None, route=None):
     """流式提问，逐段产出文本。
 
     只有 404 才换下一个候选地址（和 `_request` 的语义一致）；连不上、401、读超时都
@@ -659,7 +986,8 @@ def stream_chat(config: dict, store: CourseStore, lid, pid, question, history=No
     _require(config)
     payload = {
         "model": (config.get("model") or "deepseek-chat").strip(),
-        "messages": build_messages(config, store, lid, pid, question, history),
+        "messages": build_messages(config, store, lid, pid, question, history,
+                                   course_id=course_id, code=code, route=route),
         "stream": True,
         "temperature": 0.3,
     }

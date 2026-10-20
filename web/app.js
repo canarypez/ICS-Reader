@@ -3,18 +3,65 @@
 const $ = (s) => document.querySelector(s);
 const viewer = $("#viewer");
 const select = $("#lecture-select");
+const courseSel = $("#course-select");
+const fileInput = $("#file-input");
 const statusEl = $("#update-status");
+// 顶栏那句小字是「刚刚发生了什么」，不是常驻状态：出现后停留 5 秒就淡出。
+// 用 MutationObserver 而不是给每个赋值点加定时器 —— 导出/导入这类轮询会不停改
+// 同一行文字，每次变化都重新计时，任务结束 5 秒后自然消失。
+let statusTimer = null;
+new MutationObserver(() => {
+  clearTimeout(statusTimer);
+  if (!statusEl.textContent) return;
+  statusTimer = setTimeout(() => { statusEl.textContent = ""; }, 5000);
+}).observe(statusEl, { childList: true, characterData: true, subtree: true });
 const messagesEl = $("#messages");
 const resultsEl = $("#results");
 const scopeEl = $("#search-scope");
 const emptyEl = $("#deck-empty");
+const deckLoadingEl = $("#deck-loading");
+const deckLoadingText = $("#deck-loading-text");
 const ctxMenu = $("#ctx-menu");
 const resizer = $("#chat-resizer");
+
+// 课件区缓冲层。切换讲次/资料时先盖住旧画面，等 iframe 真正 load（资料阅读器
+// 则等第一页的 doc-page 消息）再淡出；至少显示 200ms，避免一闪而过比不显示还难受。
+let deckLoadingSeq = 0;
+let deckLoadingShownAt = 0;
+
+function showDeckLoading(text) {
+  if (!deckLoadingEl) return;
+  deckLoadingSeq++;
+  deckLoadingShownAt = Date.now();
+  deckLoadingText.textContent = text || "正在加载…";
+  deckLoadingEl.classList.add("show");
+}
+
+function hideDeckLoading() {
+  if (!deckLoadingEl || !deckLoadingEl.classList.contains("show")) return;
+  const seq = deckLoadingSeq;
+  const wait = Math.max(0, 200 - (Date.now() - deckLoadingShownAt));
+  setTimeout(() => {
+    if (seq === deckLoadingSeq) deckLoadingEl.classList.remove("show");
+  }, wait);
+}
 
 let current = null;              // {lecture, page, title, number}
 let mode = "ask";                // ask | search
 let lectureVid = {};             // 目录名 -> 外壳自己的讲 id（跳页用的 sessionStorage 键）
 let pendingQuote = null;         // 划词菜单选中待用的文本
+
+// 课程首页 / 当前课程
+let courses = [];                // /api/courses 的卡片
+let currentCourse = null;        // 当前打开的课程卡片
+let items = [];                  // 当前课程的全部 item（课件 + 资料）
+let courseMode = "ics";          // ics | docs，由当前 item 推导
+let icsLectures = [];            // 当前课程里的课件 item
+let documents = [];              // 当前课程里的资料 item
+const lastPick = { ics: "", docs: "" };
+
+let view = "home";               // home | work
+let courseJobTimer = null;
 
 // ------------------------------------------------------------------ 基础
 async function api(path, opts = {}) {
@@ -246,15 +293,67 @@ function nearBottom() {
   return messagesEl.scrollHeight - messagesEl.scrollTop - messagesEl.clientHeight < 60;
 }
 
+// 剪贴板：WebView2 下 navigator.clipboard 通常可用；浏览器直开非安全上下文时退回
+// 老式的 textarea + execCommand。两条路都失败就返回 false，按钮自己显示「复制失败」。
+async function copyText(text) {
+  const value = String(text || "");
+  if (!value) return false;
+  try {
+    if (navigator.clipboard && window.isSecureContext) {
+      await navigator.clipboard.writeText(value);
+      return true;
+    }
+  } catch (e) { /* 落到下面的退路 */ }
+  try {
+    const ta = document.createElement("textarea");
+    ta.value = value;
+    ta.setAttribute("readonly", "");
+    ta.style.position = "fixed";
+    ta.style.top = "-1000px";
+    ta.style.opacity = "0";
+    document.body.appendChild(ta);
+    ta.select();
+    ta.setSelectionRange(0, ta.value.length);
+    const ok = document.execCommand("copy");
+    ta.remove();
+    return ok;
+  } catch (e) {
+    return false;
+  }
+}
+
+// 助手消息右上角的「复制」。取的是回答原文（带 Markdown / LaTeX），不是渲染后的
+// textContent —— 后者会把公式压成 Unicode、把代码块的缩进吃掉。
+function addCopyButton(el, getText) {
+  const tools = document.createElement("div");
+  tools.className = "msg-tools";
+  const btn = document.createElement("button");
+  btn.type = "button";
+  btn.className = "msg-copy";
+  btn.textContent = "复制";
+  btn.title = "复制回答原文";
+  btn.addEventListener("click", async () => {
+    const ok = await copyText(getText());
+    btn.textContent = ok ? "已复制" : "复制失败";
+    setTimeout(() => { btn.textContent = "复制"; }, 1200);
+  });
+  tools.appendChild(btn);
+  el.appendChild(tools);
+}
+
 function addMessage(role, text) {
   const stick = nearBottom();
   const el = document.createElement("div");
   el.className = "msg " + role;
+  // __raw 是这轮回答的 Markdown 原文。流式期间先留空，收尾时由 send() 填上；
+  // 复制按钮始终读它，所以中途不会复制到渲染了一半的 DOM。
+  el.__raw = String(text || "");
   if (role === "assistant") {
     const inner = document.createElement("div");
     inner.className = "markdown";
     inner.innerHTML = md(text || "");
     el.appendChild(inner);
+    addCopyButton(el, () => el.__raw);
   } else {
     el.textContent = text;
   }
@@ -270,53 +369,379 @@ function stoppedMark() {
   return mark;
 }
 
-// ------------------------------------------------------------------ 课件
-async function loadCourse() {
-  const data = await api("/api/course");
-  // 重建 <select> 之后 value 会掉回第一项，先记下此刻看的是哪一讲
-  const prev = select.value;
+// ------------------------------------------------------------------ 课程 / 资料
+function itemById(id) {
+  return items.find((x) => x.id === id) || null;
+}
+
+function docById(id) {
+  const it = itemById(id);
+  return it && it.kind === "doc" ? it : null;
+}
+
+function fmtSize(n) {
+  n = Number(n) || 0;
+  if (n < 1024) return n + " B";
+  if (n < 1024 * 1024) return (n / 1024).toFixed(0) + " KB";
+  if (n < 1024 * 1024 * 1024) return (n / 1024 / 1024).toFixed(1) + " MB";
+  return (n / 1024 / 1024 / 1024).toFixed(2) + " GB";
+}
+
+function fmtLast(last) {
+  if (!last) return "还没有读过";
+  const item = itemById(last.lecture) || courses.find((c) => c.id === last.lecture);
+  const title = last.title || (item && item.title) || "上次的位置";
+  const page = last.number || last.page;
+  return "上次读到「" + title + "」" + (page ? " · 第 " + page + " 页" : "");
+}
+
+// ------------------------------------------------------------------ 首页
+function renderHome() {
+  const box = $("#course-cards");
+  box.innerHTML = "";
+  $("#home-empty").hidden = courses.length > 0;
+  for (let i = 0; i < courses.length; i++) {
+    const c = courses[i];
+    const card = document.createElement("article");
+    card.className = "course-card";
+    card.tabIndex = 0;
+    card.dataset.course = c.id;
+    card.style.animationDelay = `${i * 45}ms`;
+
+    const head = document.createElement("div");
+    head.className = "course-card-head";
+
+    const iconWrap = document.createElement("div");
+    iconWrap.className = "course-card-icon " + (c.kind || "files");
+    if (c.kind === "ics") {
+      iconWrap.innerHTML = '<svg viewBox="0 0 24 24" width="20" height="20" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><rect x="2" y="2" width="20" height="20" rx="4"/><path d="M7 2v20M17 2v20M2 12h20M2 7h5M2 17h5M17 7h5M17 17h5"/></svg>';
+    } else if (c.kind === "repo") {
+      iconWrap.innerHTML = '<svg viewBox="0 0 24 24" width="20" height="20" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><line x1="6" y1="3" x2="6" y2="15"/><circle cx="18" cy="6" r="3"/><circle cx="6" cy="18" r="3"/><path d="M18 9a9 9 0 0 1-9 9"/></svg>';
+    } else {
+      iconWrap.innerHTML = '<svg viewBox="0 0 24 24" width="20" height="20" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M14 2H6a2 2 0 0 0-2 2v16a2 2 0 0 0 2 2h12a2 2 0 0 0 2-2V8z"/><polyline points="14 2 14 8 20 8"/><line x1="16" y1="13" x2="8" y2="13"/><line x1="16" y1="17" x2="8" y2="17"/></svg>';
+    }
+
+    const titleWrap = document.createElement("div");
+    titleWrap.className = "course-title-wrap";
+    const title = document.createElement("h3");
+    title.textContent = c.title || c.id;
+    titleWrap.appendChild(title);
+
+    const badge = document.createElement("span");
+    badge.className = "course-badge kind-" + (c.kind || "files");
+    badge.textContent = c.kind === "ics" ? "课件" : (c.kind === "repo" ? "代码仓库" : "资料");
+    titleWrap.appendChild(badge);
+
+    head.append(iconWrap, titleWrap);
+
+    const meta = document.createElement("div");
+    meta.className = "course-meta";
+    meta.innerHTML = `<span class="meta-item">${c.item_count} 项</span>` +
+      `<span class="meta-dot">·</span><span class="meta-item">${c.page_count} 页</span>` +
+      `<span class="meta-dot">·</span><span class="meta-item">${fmtSize((c.size || 0) + (c.source_size || 0))}</span>`;
+
+    const last = document.createElement("div");
+    last.className = "course-last";
+    const lastStr = fmtLast(c.last);
+    last.innerHTML = `<svg viewBox="0 0 16 16" width="12" height="12" fill="currentColor" class="last-icon"><path d="M8 3.5a.5.5 0 0 0-1 0V9a.5.5 0 0 0 .252.434l3.5 2a.5.5 0 0 0 .496-.868L8 8.71V3.5z"/><path d="M8 16A8 8 0 1 0 8 0a8 8 0 0 0 0 16zm7-8A7 7 0 1 1 1 8a7 7 0 0 1 14 0z"/></svg><span>${escapeHtml(lastStr)}</span>`;
+
+    const actions = document.createElement("div");
+    actions.className = "course-actions";
+    const open = document.createElement("button");
+    open.type = "button";
+    open.className = "primary btn-card-open";
+    open.textContent = c.last ? "继续阅读" : "打开";
+    open.addEventListener("click", (e) => {
+      e.stopPropagation();
+      openCourse(c.id);
+    });
+    actions.appendChild(open);
+
+    if (c.kind !== "ics") {
+      const upd = document.createElement("button");
+      upd.type = "button";
+      upd.className = "btn-card-action";
+      upd.textContent = "更新";
+      upd.addEventListener("click", async (e) => {
+        e.stopPropagation();
+        await updateCourse(c.id);
+      });
+      actions.appendChild(upd);
+    }
+    if (c.deletable) {
+      const del = document.createElement("button");
+      del.type = "button";
+      del.className = "danger btn-card-action";
+      del.textContent = "删除";
+      del.addEventListener("click", (e) => {
+        e.stopPropagation();
+        deleteCourse(c);
+      });
+      actions.appendChild(del);
+    }
+
+    card.append(head, meta, last, actions);
+    card.addEventListener("click", () => openCourse(c.id));
+    card.addEventListener("keydown", (e) => {
+      if (e.key === "Enter" || e.key === " ") { e.preventDefault(); openCourse(c.id); }
+    });
+    box.appendChild(card);
+  }
+}
+
+async function loadCourses() {
+  try {
+    const data = await api("/api/courses");
+    courses = data.courses || [];
+  } catch (e) {
+    courses = [];
+    statusEl.textContent = "读取课程失败：" + e.message;
+  }
+  renderHome();
+  return courses;
+}
+
+function showView(v) {
+  view = v;
+  const isHome = v === "home";
+  const homeEl = $("#home-view");
+  const workEl = $("#work-view");
+  const topbar = $(".topbar");
+
+  if (topbar) topbar.hidden = isHome;
+  homeEl.hidden = !isHome;
+  workEl.hidden = isHome;
+
+  if (isHome) {
+    homeEl.classList.remove("view-fade-in");
+    void homeEl.offsetWidth;
+    homeEl.classList.add("view-fade-in");
+    $("#course-title").hidden = true;
+    $("#btn-add-course").hidden = false;
+  } else {
+    workEl.classList.remove("view-fade-in");
+    void workEl.offsetWidth;
+    workEl.classList.add("view-fade-in");
+    $("#course-title").hidden = false;
+    $("#btn-add-course").hidden = true;
+  }
+}
+
+function showHome() {
+  hideDeckLoading();
+  showView("home");
+  currentCourse = null;
+  items = [];
+  icsLectures = [];
+  documents = [];
+  lastProgress = "";
+  loadCourses();
+}
+
+// 重建讲次/资料下拉框。preferred 是重建后想继续选中的 id（不传就沿用当前值）。
+// 重建 <select> 会把 value 掉回第一项，所以必须显式恢复，否则更新一跑完正在读的人
+// 就被弹回第一讲第一页。
+function rebuildSelect(preferred) {
+  const prev = preferred !== undefined ? preferred : select.value;
   lectureVid = {};
   select.innerHTML = "";
-  if (!data.lectures || data.lectures.length === 0) {
-    select.innerHTML = '<option value="">（暂无课件）</option>';
-    // 首次启动自动更新可能还在跑：盯一下，跑完自动重载
-    const st = await api("/api/update/status");
-    if (st.running) { emptyEl.textContent = "正在渲染课件，请稍候…"; watchUpdate(); }
-    else { emptyEl.textContent = "还没有课件，点右上角「更新」渲染"; }
+  if (!items.length) {
+    select.innerHTML = '<option value="">（这门课还没有内容）</option>';
+    lastPick.ics = "";
+    lastPick.docs = "";
     return;
   }
-  for (const lec of data.lectures) {
+  for (const item of items) {
     const o = document.createElement("option");
-    o.value = lec.id;
-    o.textContent = lec.title + "（" + lec.id + "）";
+    o.value = item.id;
+    const isDoc = item.kind === "doc";
+    o.textContent = item.title + "（" + (isDoc ? item.page_count + " 页" : "课件") + "）";
     select.appendChild(o);
-    lectureVid[lec.id] = lec.vid || lec.id;
+    if (!isDoc) lectureVid[item.id] = item.vid || item.id;
   }
-  // 这一讲还在，就接着看这一讲。loadCourse 的调用方是「更新跑完了」和启动，
-  // 都不是「换一讲」的意思；照 select.value（此刻已经是第一项）打开，
-  // 会把正在读的人弹回第一讲第一页。
-  if (lectureVid[prev]) select.value = prev;
-  openLecture(select.value);
+  if (items.some((x) => x.id === prev)) select.value = prev;
+  const it = itemById(select.value);
+  if (it) lastPick[it.kind === "doc" ? "docs" : "ics"] = select.value;
+}
+
+function refreshModeUI() {
+  const it = itemById(select.value);
+  const docs = !!(it && it.kind === "doc");
+  const kind = currentCourse ? currentCourse.kind : "ics";
+  // 任何已打开的课程都能继续加资料，ICS 也不例外（上传的 PDF 会挂在这门课下面）。
+  $("#btn-upload").hidden = !currentCourse;
+  $("#btn-delete-doc").hidden = !docs;
+  $("#btn-update").hidden = !currentCourse || (kind === "files" && it && it.kind === "doc");
+  $("#btn-export").hidden = !(currentCourse && kind === "ics" && it && it.kind !== "doc");
+  scopeEl.options[0].textContent = docs ? "本资料" : "本讲";
+  if (scopeEl.options[1]) {
+    scopeEl.options[1].textContent = "本课程";
+    scopeEl.options[1].hidden = false;
+    scopeEl.options[1].disabled = false;
+  }
+}
+
+function setCourseMode(m, preferredId) {
+  courseMode = m === "docs" ? "docs" : "ics";
+  if (courseSel) courseSel.value = courseMode;
+  rebuildSelect(preferredId);
+  refreshModeUI();
+}
+
+function openSelected() {
+  const it = itemById(select.value);
+  if (!it) return;
+  if (it.kind === "doc") openDocument(select.value);
+  else openLecture(select.value);
+}
+
+// 打开课程：先取课程详情，再按进度恢复到最后读的 item / 页码。
+async function openCourse(cid, opts = {}) {
+  const card = [...document.querySelectorAll(".course-card")]
+    .find((c) => c.dataset.course === cid);
+  if (card) card.classList.add("is-loading");
+  let data;
+  try {
+    data = await api("/api/course?course=" + encodeURIComponent(cid));
+  } catch (e) {
+    statusEl.textContent = "打开课程失败：" + e.message;
+    return;
+  } finally {
+    if (card) card.classList.remove("is-loading");
+  }
+  if (!data || data.error) {
+    statusEl.textContent = (data && data.error) || "课程不存在";
+    await loadCourses();
+    return;
+  }
+  currentCourse = data.course || { id: cid, title: cid, kind: "files" };
+  icsLectures = data.lectures || [];
+  documents = data.documents || [];
+  items = icsLectures.concat(documents);
+  const kind = currentCourse.kind || "ics";
+  if (kind === "ics") items.sort((a, b) => a.id.localeCompare(b.id, "zh"));
+  else items.sort((a, b) => (b.added || 0) - (a.added || 0));
+
+  showView("work");
+  $("#course-title").textContent = currentCourse.title || "";
+  $("#course-title").title = currentCourse.title || "";
+  loadedLecture = loadedDoc = null;
+  current = null;
+  lastProgress = "";
+
+  const last = data.last || null;
+  const pick = opts.item || (last && last.lecture) || (items[0] && items[0].id) || "";
+  rebuildSelect(pick);
+  if (!pick) {
+    hideDeckLoading();
+    viewer.src = "about:blank";
+    emptyEl.textContent = kind === "ics"
+      ? "还没有渲染课件。点「更新」或到首页导入仓库。"
+      : "这门课还没有内容，点「上传资料」或重新导入。";
+    emptyEl.style.display = "flex";
+    resetChat();
+    refreshModeUI();
+    return;
+  }
+  const startPage = opts.page ||
+    (last && last.lecture === pick ? { number: last.number, index: last.index,
+                                       page: last.page } : null);
+  openItem(pick, startPage);
+}
+
+// 兼容旧调用：prefer 可以是 {mode,id}，也可以直接给 item id
+async function loadCourse(prefer) {
+  if (!currentCourse) { await loadCourses(); showHome(); return; }
+  const id = typeof prefer === "string" ? prefer : (prefer && prefer.id) || "";
+  await openCourse(currentCourse.id, { item: id || undefined });
+}
+
+function openItem(id, start) {
+  const it = itemById(id);
+  if (!it) return;
+  courseMode = it.kind === "doc" ? "docs" : "ics";
+  if (courseSel) courseSel.value = courseMode;
+  select.value = id;
+  lastPick[courseMode] = id;
+  refreshModeUI();
+  if (it.kind === "doc") openDocument(id, start && (start.number || start));
+  else openLecture(id, start);
 }
 
 let loadedLecture = null;        // 课件区里现在装着哪一讲
+let loadedDoc = null;            // 资料区里现在装着哪一份
 
-function openLecture(id) {
+function openLecture(id, start) {
   const changed = id !== loadedLecture;
   loadedLecture = id;
+  loadedDoc = null;
   if (!id) {
+    hideDeckLoading();
     viewer.src = "about:blank";
     current = null;
+    emptyEl.textContent = "还没有课件，点「更新」渲染";
+    emptyEl.style.display = "flex";
+    resetChat();
+    return;
+  }
+  const it = itemById(id);
+  const base = (it && it.base) || ("/lectures/" + id + "/");
+  // 恢复进度：把页码写进 lecturekit 的 sessionStorage 键，外壳加载时会读它
+  if (start && start.index != null) {
+    saveIcsPosition(id, start.index, start.page || "");
+  }
+  emptyEl.style.display = "none";
+  showDeckLoading(changed ? "正在打开课件…" : "正在刷新课件…");
+  viewer.src = base.replace(/\/?$/, "/") + "index.html";
+  current = current && current.lecture === id ? current : null;
+  // 对话按讲分，换了讲就不能把上一讲的聊天记录留在眼前。
+  // 但同一讲重载（更新跑完、保存设置）不算换讲 —— 那会把正在进行的对话也抹掉。
+  if (changed) resetChat();
+}
+
+function openDocument(id, page) {
+  const changed = id !== loadedDoc;
+  // 同一份资料重载（更新跑完）时留在当前页；docview 自己会把页码报回来。
+  const keep = (!changed && current && current.number) || null;
+  loadedDoc = id;
+  loadedLecture = null;
+  if (!id) {
+    hideDeckLoading();
+    viewer.src = "about:blank";
+    current = null;
+    emptyEl.textContent = documents.length
+      ? "请选择一份资料"
+      : "还没有上传资料，点「上传资料」添加 PDF、PPTX 或 Markdown";
     emptyEl.style.display = "flex";
     resetChat();
     return;
   }
   emptyEl.style.display = "none";
-  viewer.src = "/lectures/" + id + "/index.html";
-  current = current && current.lecture === id ? current : null;
-  // 对话按讲分，换了讲就不能把上一讲的聊天记录留在眼前。
-  // 但同一讲重载（更新跑完、保存设置）不算换讲 —— 那会把正在进行的对话也抹掉。
-  if (changed) resetChat();
+  const start = page || keep;
+  showDeckLoading(changed ? "正在加载资料…" : "正在重新加载资料…");
+  viewer.src = "docview.html?doc=" + encodeURIComponent(id) +
+    (start ? "&page=" + encodeURIComponent(start) : "");
+  if (changed) { current = null; resetChat(); }
+}
+
+// 阅读进度：轮询当前页，变化时防抖写回服务端；刷新/重启后能接着读。
+let lastProgress = "";
+function trackProgress() {
+  if (view !== "work" || !currentCourse || !select.value) return;
+  const p = currentPage();
+  if (!p) return;
+  const key = select.value + "|" + p.page;
+  if (key === lastProgress) return;
+  lastProgress = key;
+  const it = itemById(select.value) || {};
+  api("/api/progress", {
+    method: "POST",
+    body: {
+      course: currentCourse.id, lecture: select.value, page: p.page,
+      number: p.number, index: p.index, title: p.title || it.title || "",
+      total: it.page_count || 0,
+    },
+  }).catch(() => {});
 }
 
 // 读进两层 iframe：外壳(index.html) → .slide-frame(slides.html)
@@ -336,6 +761,17 @@ function innerDoc() {
 // 从内嵌的课件阅读器里读出「当前正在看哪一页」
 // 外壳用 #N 定位第 N 张幻灯片，与 lecture.json 的 pages[N-1] 一一对应。
 function currentPage() {
+  // 资料阅读器是单层 iframe，直接把页码挂在 window.__reader 上（同源，可读）。
+  // 页面滚动/翻页时它还会 postMessage 一份，见下面的 message 监听。
+  if (courseMode === "docs") {
+    try {
+      const s = viewer.contentWindow && viewer.contentWindow.__reader;
+      if (s) {
+        return { page: s.page, title: s.title || "", number: s.number, index: s.index };
+      }
+    } catch (e) { /* 还在加载 */ }
+    return null;
+  }
   let doc;
   try { doc = viewer.contentDocument; } catch (e) { return null; }
   if (!doc) return null;
@@ -361,7 +797,7 @@ function livePage() {
 // ------------------------------------------------------------------ 跳页
 // 外壳把阅读位置存在 sessionStorage（键 lecturekit:viewer:<外壳讲id>）并在载入时恢复，
 // 所以跳页 = 改写这个键 + 让外壳重载；已经在看幻灯片时直接改内层 hash 更快。
-async function jumpTo(lid, index, pageId) {
+function saveIcsPosition(lid, index, pageId) {
   const vid = lectureVid[lid] || lid;
   const key = "lecturekit:viewer:" + vid;
   let st = {};
@@ -369,9 +805,41 @@ async function jumpTo(lid, index, pageId) {
   st.mode = "slide";
   st.currentPageId = pageId;
   try { sessionStorage.setItem(key, JSON.stringify(st)); } catch (e) { /* 无存储 */ }
+}
 
+async function jumpTo(lid, index, pageId, kind, courseId) {
+  // 结果可能来自另一门课：先把那门课打开，再定位。
+  if (courseId && (!currentCourse || currentCourse.id !== courseId)) {
+    await openCourse(courseId, { item: lid });
+  }
+  const target = kind === "doc" ? "docs" : "ics";
+  if (target !== courseMode) {
+    setCourseMode(target, lid);
+    if (target === "docs") {
+      openDocument(lid, index + 1);
+    } else {
+      saveIcsPosition(lid, index, pageId);
+      openLecture(lid);         // 外壳 restoreState() 会直接落到这一页
+    }
+    return;
+  }
+
+  if (courseMode === "docs") {
+    if (select.value !== lid) {
+      select.value = lid;
+      lastPick.docs = lid;
+      openDocument(lid, index + 1);
+    } else {
+      try { viewer.contentWindow.goTo(index + 1); }
+      catch (e) { openDocument(lid, index + 1); }
+    }
+    return;
+  }
+
+  saveIcsPosition(lid, index, pageId);
   if (select.value !== lid) {
     select.value = lid;
+    lastPick.ics = lid;
     openLecture(lid);           // 外壳 restoreState() 会直接落到这一页
     return;
   }
@@ -383,7 +851,7 @@ async function jumpTo(lid, index, pageId) {
 // ------------------------------------------------------------------ 模式切换
 function setMode(m) {
   mode = m;
-  for (const t of document.querySelectorAll(".tab")) {
+  for (const t of document.querySelectorAll(".tab[data-mode]")) {
     t.classList.toggle("active", t.dataset.mode === m);
   }
   const isSearch = m === "search";
@@ -402,7 +870,10 @@ async function doSearch() {
   try {
     r = await api("/api/search", {
       method: "POST",
-      body: { query: q, scope: scopeEl.value, lecture: select.value },
+      body: {
+        query: q, scope: scopeEl.value, lecture: select.value,
+        course: currentCourse ? currentCourse.id : "",
+      },
     });
   } catch (e) {
     resultsEl.innerHTML = '<div class="result-empty">搜索失败：' + escapeHtml(e.message) + "</div>";
@@ -431,7 +902,16 @@ function renderResults(list, q) {
     const tag = document.createElement("span");
     tag.className = "result-tag";
     tag.textContent = "第 " + (r.page_number || "?") + " 页";
-    meta.append(tag, document.createTextNode(r.lecture_title || r.lecture));
+    const crs = courses.find((c) => c.id === r.course_id);
+    if (crs && (!currentCourse || crs.id !== currentCourse.id)) {
+      const ctag = document.createElement("span");
+      ctag.className = "result-tag course";
+      ctag.textContent = crs.title;
+      meta.append(tag, ctag);
+    } else {
+      meta.append(tag);
+    }
+    meta.append(document.createTextNode(r.lecture_title || r.lecture));
     const title = document.createElement("div");
     title.className = "result-title";
     title.textContent = r.page_title || r.page;
@@ -442,7 +922,8 @@ function renderResults(list, q) {
       sn.textContent = r.snippet;
       row.appendChild(sn);
     }
-    row.addEventListener("click", () => jumpTo(r.lecture, r.index, r.page));
+    row.addEventListener("click", () =>
+      jumpTo(r.lecture, r.index, r.page, r.kind, r.course_id));
     resultsEl.appendChild(row);
   }
 }
@@ -471,7 +952,12 @@ function setSending(on) {
 async function send() {
   const q = $("#question").value.trim();
   if (!q) return;
-  if (!select.value) { addMessage("error", "还没有可用的课件，先点右上角「更新」渲染。"); return; }
+  if (!select.value) {
+    addMessage("error", courseMode === "docs"
+      ? "还没有上传资料，先点「上传资料」添加 PDF 或 PPTX。"
+      : "还没有可用的课件，先点右上角「更新」渲染。");
+    return;
+  }
   if (streaming) return;                       // 正在回答，别叠着发
 
   const p = livePage();
@@ -484,6 +970,7 @@ async function send() {
 
   addMessage("user", q);
   $("#question").value = "";
+  if (typeof clearCodeRef === "function") clearCodeRef();
   conv.messages.push({ role: "user", content: q, page: p ? p.page : null });
 
   const el = addMessage("assistant", "");
@@ -525,6 +1012,7 @@ async function send() {
       signal: ctl.signal,
       body: JSON.stringify({
         lecture: lid, page: p ? p.page : null, question: q, cid, history,
+        course: currentCourse ? currentCourse.id : "",
       }),
     });
     if (!res.ok || !res.body) {
@@ -550,7 +1038,16 @@ async function send() {
         const ev = parseFrame(buf.slice(0, cut));
         buf = buf.slice(cut + 2);
         if (!ev) continue;
-        if (ev.type === "delta") { answer += ev.content; paint(false); }
+        if (ev.type === "meta") {
+          const label = ev.route === "course" ? "全课程检索"
+            : ev.route === "code" ? "代码联动" : "";
+          if (label) {
+            const badge = document.createElement("span");
+            badge.className = "route-badge " + ev.route;
+            badge.textContent = label;
+            el.insertBefore(badge, inner);
+          }
+        } else if (ev.type === "delta") { answer += ev.content; paint(false); }
         else if (ev.type === "error") throw new Error(ev.error);
         else if (ev.type === "title") {
           conv.title = ev.title;
@@ -572,6 +1069,7 @@ async function send() {
     } else {
       // 收尾用原文而不是 balanced() 补过的：真闭合符没到就不该在最后留下一个假的
       inner.innerHTML = md(answer || (stopped ? "" : "（空回答）"));
+      el.__raw = answer;                 // 复制按钮取原文（Markdown / LaTeX 都保留）
       if (stick) messagesEl.scrollTop = messagesEl.scrollHeight;
       el.classList.remove("streaming");
       if (answer) {
@@ -662,7 +1160,8 @@ function renderHistory() {
   const box = $("#history-list");
   box.innerHTML = "";
   if (!historyCache.length) {
-    box.innerHTML = '<div class="hist-empty">这一讲还没有对话</div>';
+    box.innerHTML = '<div class="hist-empty">' +
+      (courseMode === "docs" ? "这份资料还没有对话" : "这一讲还没有对话") + "</div>";
     return;
   }
   for (const c of historyCache) {
@@ -776,6 +1275,20 @@ function closeCtxMenu() {
 
 // 换讲或重载都会把内层文档整个重建，所以要反复确认监听还在；两个标志位防重复挂。
 function ensureQuoteInjection() {
+  // 资料阅读器只有一层 iframe，直接挂在外层文档上。左右翻页由 docview 自己处理，
+  // 这里只接划词菜单（引用 / 解释 / 复制），让资料页也能像 ICS 课件一样提问。
+  if (courseMode === "docs") {
+    let doc;
+    try { doc = viewer.contentDocument; } catch (e) { return; }
+    if (!doc || !doc.body) return;
+    if (!doc.__quoteHooked) {
+      doc.__quoteHooked = true;
+      doc.addEventListener("contextmenu", onInnerContextMenu);
+      doc.addEventListener("mouseup", onInnerMouseUp);
+    }
+    return;
+  }
+
   const doc = innerDoc();
   if (!doc || !doc.body) return;
   if (!doc.__quoteHooked) {
@@ -875,6 +1388,8 @@ document.addEventListener("scroll", closeCtxMenu, true);
 let exportTimer = null;
 
 async function exportPdf() {
+  // 只有 ICS 的渲染产物有 marp 导出链路；仓库课件和上传资料没有
+  if (!currentCourse || currentCourse.kind !== "ics") return;
   const lid = select.value;
   if (!lid) { statusEl.textContent = "先选一讲"; return; }
   const opt = select.options[select.selectedIndex];
@@ -939,27 +1454,321 @@ function showExportDone(path) {
   messagesEl.scrollTop = messagesEl.scrollHeight;
 }
 
-// ------------------------------------------------------------------ 更新
-let updateTimer = null;
-function watchUpdate() {
-  if (updateTimer) clearInterval(updateTimer);
-  $("#btn-update").disabled = true;
-  updateTimer = setInterval(async () => {
-    const st = await api("/api/update/status");
-    const last = st.lines && st.lines.length ? st.lines[st.lines.length - 1] : "";
-    statusEl.textContent = (st.running ? "更新中：" : "完成：") + (last || "");
-    if (!st.running) {
-      clearInterval(updateTimer);
-      updateTimer = null;
-      $("#btn-update").disabled = false;
-      loadCourse(); // 重新读课程列表
+// ------------------------------------------------------------------ 添加课程 / 导入资料
+let pendingFiles = [];         // [{file} | {path, name}]
+let importTab = "files";
+
+function openImport(tab) {
+  importTab = tab || "files";
+  for (const t of document.querySelectorAll("[data-import-tab]")) {
+    t.classList.toggle("active", t.dataset.importTab === importTab);
+  }
+  // 从课程里点「上传资料」时，留空就是加到这门课；从首页「添加课程」进来才是
+  // 新建课程 / 放进「我的资料」。文案要说清楚落点，免得用户以为又建了一门。
+  const inCourse = view === "work" && !!currentCourse;
+  $("#import-title").textContent = inCourse ? "添加课件" : "添加课程";
+  $("#import-file-course").placeholder = inCourse
+    ? "留空则放进「" + (currentCourse.title || "当前课程") + "」"
+    : "留空则放进「我的资料」";
+  $("#import-files").hidden = importTab !== "files";
+  $("#import-repo").hidden = importTab !== "repo";
+  $("#repo-log").hidden = true;
+  $("#repo-log").textContent = "";
+  $("#btn-import-start").disabled = false;
+  $("#import-modal").showModal();
+}
+
+function setImportTab(tab) {
+  importTab = tab;
+  for (const t of document.querySelectorAll("[data-import-tab]")) {
+    t.classList.toggle("active", t.dataset.importTab === tab);
+  }
+  $("#import-files").hidden = tab !== "files";
+  $("#import-repo").hidden = tab !== "repo";
+}
+
+function addPendingFiles(list) {
+  const known = new Set(pendingFiles.map((f) => f.name));
+  for (const f of list || []) {
+    if (!f || !f.name || known.has(f.name)) continue;
+    if (!/\.(pdf|pptx|md)$/i.test(f.name)) continue;
+    known.add(f.name);
+    pendingFiles.push(f);
+  }
+  renderPendingFiles();
+}
+
+function renderPendingFiles() {
+  const box = $("#import-file-list");
+  box.innerHTML = "";
+  for (let i = 0; i < pendingFiles.length; i++) {
+    const f = pendingFiles[i];
+    const li = document.createElement("li");
+    const name = document.createElement("span");
+    name.textContent = f.name;
+    const del = document.createElement("button");
+    del.type = "button";
+    del.className = "ghost";
+    del.textContent = "×";
+    del.addEventListener("click", () => {
+      pendingFiles.splice(i, 1);
+      renderPendingFiles();
+    });
+    li.append(name, del);
+    box.appendChild(li);
+  }
+}
+
+async function pickFiles() {
+  const bridge = window.pywebview && window.pywebview.api;
+  if (bridge && bridge.pick_documents) {
+    let paths = [];
+    try { paths = await bridge.pick_documents(); } catch (e) { paths = []; }
+    if (typeof paths === "string") paths = [paths];
+    addPendingFiles((paths || []).map((p) => ({
+      path: p, name: String(p).split(/[\\/]/).pop(),
+    })));
+    return;
+  }
+  if (bridge && bridge.pick_document) {
+    let path = null;
+    try { path = await bridge.pick_document(); } catch (e) { path = null; }
+    if (path) addPendingFiles([{ path, name: String(path).split(/[\\/]/).pop() }]);
+    return;
+  }
+  fileInput.click();
+}
+
+// 上传落点：填了课程名 → 按名字找/建课程；否则留在当前课程；
+// 首页直接上传则交给服务端放进「我的资料」。
+function importTarget() {
+  const title = $("#import-file-course").value.trim();
+  if (title) return { title, course: "" };
+  if (currentCourse && view === "work") {
+    return { title: "", course: currentCourse.id };
+  }
+  return { title: "", course: "" };
+}
+
+async function uploadOne(file, target) {
+  if (file.path) {
+    // 桌面版：只给路径，文件不经过 JS，免得大 PDF 占内存
+    const body = { path: file.path };
+    if (target.course) body.course = target.course;
+    else if (target.title) body.title = target.title;
+    const r = await api("/api/doc/upload", { method: "POST", body });
+    if (r.error) throw new Error(r.error);
+    return r;
+  }
+  const qs = new URLSearchParams();
+  if (target.course) qs.set("course", target.course);
+  else if (target.title) qs.set("title", target.title);
+  // 不能走 api()：它会 JSON.stringify，二进制必须原样发。
+  // 浏览器给的 File 本身就是 Blob；原生选择器给的是 {path, name}，不会走到这里。
+  const blob = file.file || file;
+  const name = file.name || blob.name || "upload";
+  const res = await fetch("/api/doc/upload?" + qs.toString(), {
+    method: "POST",
+    headers: {
+      "Content-Type": "application/octet-stream",
+      "X-Filename": encodeURIComponent(name),
+    },
+    body: blob,
+  });
+  let r = {};
+  try { r = await res.json(); } catch (e) { /* 非 JSON 用状态码 */ }
+  if (!res.ok || r.error) throw new Error(r.error || ("HTTP " + res.status));
+  return r;
+}
+
+async function startImport() {
+  if (importTab === "repo") return startRepoImport();
+  if (!pendingFiles.length) {
+    $("#import-file-status").textContent = "先选择文件（PDF / PPTX / Markdown）。";
+    return;
+  }
+  const target = importTarget();
+  const status = $("#import-file-status");
+  status.textContent = "正在导入…（PPTX 需要调用 PowerPoint/WPS，可能要几十秒）";
+  $("#btn-import-start").disabled = true;
+  let cid = target.course;
+  let title = target.title;
+  let done = 0;
+  const errors = [];
+  for (const f of pendingFiles) {
+    status.textContent = "正在导入 " + (done + 1) + "/" + pendingFiles.length +
+      "：" + f.name + "…";
+    try {
+      const r = await uploadOne(f, { course: cid, title });
+      cid = r.course_id || cid;      // 第一份新建课程后，后面的都进同一门课
+      title = "";                    // 避免每份都再建一门课
+      done++;
+    } catch (e) {
+      errors.push(f.name + "：" + e.message);
     }
-  }, 1200);
+  }
+  status.textContent = "完成：" + done + "/" + pendingFiles.length +
+    (errors.length ? "；失败 " + errors.join("；") : "");
+  $("#btn-import-start").disabled = false;
+  pendingFiles = [];
+  renderPendingFiles();
+  await loadCourses();
+  if (cid) await openCourse(cid);
+  if (!errors.length) $("#import-modal").close();
+}
+
+async function scanRepo() {
+  const source = $("#import-repo-source").value.trim();
+  const box = $("#repo-scan-result");
+  const warn = $("#repo-warning");
+  if (!source) { box.hidden = false; box.textContent = "先填路径或 Git 地址。"; return; }
+  box.hidden = false;
+  box.textContent = "正在扫描…";
+  warn.hidden = true;
+  try {
+    const info = await api("/api/course/scan", { method: "POST", body: { source } });
+    if (info.error) { box.textContent = "扫描失败：" + info.error; return; }
+    if (info.remote) {
+      box.textContent = "远端仓库：导入后会浅克隆并扫描。";
+      return;
+    }
+    box.textContent = "课件 " + (info.lectures || []).length + " 个 · 资料 " +
+      (info.decks || []).length + " 份 · 代码根 " +
+      (info.code_roots || []).length + " 个" +
+      (info.is_git ? " · Git 仓库" : "");
+    warn.hidden = !(info.lectures || []).length;
+  } catch (e) {
+    box.textContent = "扫描失败：" + e.message;
+  }
+}
+
+async function startRepoImport() {
+  const source = $("#import-repo-source").value.trim();
+  if (!source) { $("#repo-scan-result").hidden = false; $("#repo-scan-result").textContent = "先填路径或 Git 地址。"; return; }
+  const r = await api("/api/course/import", {
+    method: "POST",
+    body: {
+      type: "repo", source,
+      title: $("#import-repo-title").value.trim(),
+      with_decks: $("#import-with-decks").checked,
+    },
+  });
+  if (r.error) {
+    $("#repo-scan-result").hidden = false;
+    $("#repo-scan-result").textContent = "导入失败：" + r.error;
+    return;
+  }
+  const log = $("#repo-log");
+  log.hidden = false;
+  log.textContent = "正在导入…";
+  $("#btn-import-start").disabled = true;
+  watchCourseJob(log);
+}
+
+// 后台课程任务（导入 / 更新）轮询。日志写进给定元素，完成后刷新首页。
+// openAfter 为 false 时只刷新当前课程，不因为一次「更新」把用户从首页拽进课程。
+function watchCourseJob(logEl, openAfter = true) {
+  if (courseJobTimer) clearInterval(courseJobTimer);
+  courseJobTimer = setInterval(async () => {
+    let st;
+    try { st = await api("/api/course/job"); } catch (e) { return; }
+    const lines = st.lines || [];
+    if (logEl) {
+      logEl.textContent = lines.join("\n") || "…";
+      logEl.scrollTop = logEl.scrollHeight;
+    }
+    statusEl.textContent = st.running ? "任务进行中：" + (lines[lines.length - 1] || "")
+      : (st.error ? "任务失败" : "任务完成");
+    if (st.running) return;
+    clearInterval(courseJobTimer);
+    courseJobTimer = null;
+    $("#btn-import-start").disabled = false;
+    await loadCourses();
+    if (st.error) {
+      if (logEl) logEl.textContent += "\n" + st.error;
+      return;
+    }
+    const done = st.result || {};
+    if (openAfter && done.course_id) {
+      $("#import-modal").close();
+      await openCourse(done.course_id);
+    } else if (view === "work" && currentCourse) {
+      await openCourse(currentCourse.id, { item: select.value });
+    }
+  }, 1000);
+}
+
+async function deleteDocument() {
+  if (courseMode !== "docs" || !select.value) return;
+  const d = docById(select.value);
+  const title = d ? d.title : "这份资料";
+  if (!window.confirm("删除《" + title + "》？\n它的页面、阅读进度、标注和对话历史会一起删除。")) return;
+  const r = await api("/api/doc/delete", { method: "POST", body: { id: select.value } });
+  if (r.error) { statusEl.textContent = "删除失败：" + r.error; return; }
+  statusEl.textContent = "已删除";
+  if (currentCourse) await openCourse(currentCourse.id);
+  await loadCourses();
+}
+
+async function updateCourse(cid) {
+  const r = await api("/api/course/update", { method: "POST", body: { course: cid } });
+  if (r.error) { statusEl.textContent = "更新失败：" + r.error; return; }
+  statusEl.textContent = "更新已启动…";
+  watchCourseJob($("#repo-log"), false);
+}
+
+async function deleteCourse(card) {
+  if (!card || !card.deletable) return;
+  if (!window.confirm("删除课程《" + card.title + "》？\n课程里的资料、索引、进度和对话都会删除。")) return;
+  const r = await api("/api/course/delete", {
+    method: "POST", body: { course: card.id },
+  });
+  if (r.error) { statusEl.textContent = "删除失败：" + r.error; return; }
+  statusEl.textContent = "课程已删除";
+  if (currentCourse && currentCourse.id === card.id) showHome();
+  else await loadCourses();
+}
+
+// ------------------------------------------------------------------ 更新
+// ICS 走原来的 /api/update（更新作业在 update_job 里），不能套用课程作业的轮询。
+let icsUpdateTimer = null;
+function watchUpdate() {
+  $("#btn-update").disabled = true;
+  if (icsUpdateTimer) clearInterval(icsUpdateTimer);
+  icsUpdateTimer = setInterval(async () => {
+    let st;
+    try { st = await api("/api/update/status"); } catch (e) { return; }
+    const lines = st.lines || [];
+    statusEl.textContent = st.running
+      ? "更新中：" + (lines[lines.length - 1] || "")
+      : (st.error ? "更新失败" : "更新完成");
+    if (st.running) return;
+    clearInterval(icsUpdateTimer);
+    icsUpdateTimer = null;
+    $("#btn-update").disabled = false;
+    if (st.error) return;
+    await loadCourses();
+    if (currentCourse && currentCourse.id === "ics") {
+      await openCourse("ics", { item: select.value });
+    }
+  }, 1000);
 }
 
 async function triggerUpdate() {
-  await api("/api/update", { method: "POST" });
+  if (!currentCourse) return;
+  if (currentCourse.id === "ics") {
+    // ICS 仍走原来的整仓渲染链路（配置里有 repo 路径和 lecture.py 环境）
+    const r = await api("/api/update", { method: "POST" });
+    if (r.error) { statusEl.textContent = "更新失败：" + r.error; return; }
+    if (!r.started) { statusEl.textContent = "已有更新在进行"; return; }
+  } else {
+    const r = await api("/api/course/update", {
+      method: "POST", body: { course: currentCourse.id },
+    });
+    if (r.error) { statusEl.textContent = "更新失败：" + r.error; return; }
+  }
   statusEl.textContent = "更新已启动…";
+  $("#btn-update").disabled = true;
   watchUpdate();
 }
 
@@ -1051,6 +1860,16 @@ function applyTheme() {
     ? prefs.theme
     : (media.matches ? "dark" : "light");
   document.documentElement.dataset.theme = t;
+  syncViewerTheme();
+}
+
+// iframe 有自己独立的 :root，不会继承父页面的 data-theme。资料阅读器用 postMessage
+// 接主题；ICS 的嵌套阅读器忽略这条消息即可。
+function syncViewerTheme() {
+  try {
+    const t = document.documentElement.dataset.theme || "light";
+    viewer.contentWindow.postMessage({ type: "theme", theme: t }, "*");
+  } catch (e) { /* iframe 还没就绪 */ }
 }
 
 // 选了「跟随系统」才理系统，强制了就别跟
@@ -1124,7 +1943,58 @@ async function saveSettings() {
 }
 
 // ------------------------------------------------------------------ 绑定
-select.addEventListener("change", () => openLecture(select.value));
+courseSel.addEventListener("change", () => {
+  const m = courseSel.value;
+  setCourseMode(m, lastPick[m] || "");
+  openSelected();
+});
+select.addEventListener("change", () => {
+  const it = itemById(select.value);
+  if (it) courseMode = it.kind === "doc" ? "docs" : "ics";
+  lastPick[courseMode] = select.value;
+  refreshModeUI();
+  openSelected();
+});
+$("#btn-home").addEventListener("click", showHome);
+$("#btn-add-course").addEventListener("click", () => openImport("files"));
+$("#btn-upload").addEventListener("click", () => openImport("files"));
+$("#btn-delete-doc").addEventListener("click", deleteDocument);
+for (const t of document.querySelectorAll("[data-import-tab]")) {
+  t.addEventListener("click", () => setImportTab(t.dataset.importTab));
+}
+$("#btn-pick-files").addEventListener("click", pickFiles);
+$("#btn-import-cancel").addEventListener("click", () => $("#import-modal").close());
+$("#btn-import-start").addEventListener("click", startImport);
+$("#btn-repo-scan").addEventListener("click", scanRepo);
+$("#drop-zone").addEventListener("dragover", (e) => {
+  e.preventDefault();
+  $("#drop-zone").classList.add("over");
+});
+$("#drop-zone").addEventListener("dragleave", () => $("#drop-zone").classList.remove("over"));
+$("#drop-zone").addEventListener("drop", (e) => {
+  e.preventDefault();
+  $("#drop-zone").classList.remove("over");
+  addPendingFiles(Array.from((e.dataTransfer && e.dataTransfer.files) || []));
+});
+fileInput.addEventListener("change", () => {
+  addPendingFiles(Array.from(fileInput.files || []));
+  fileInput.value = "";          // 清掉，才能连续选同一个文件
+});
+// 资料阅读器翻页后把当前页报上来。currentPage() 也能直接读 window.__reader，
+// 这条消息主要是让「网页刚加载完、__reader 还没赋值」的空档也有值。
+window.addEventListener("message", (e) => {
+  const d = e.data;
+  if (!d || typeof d !== "object" || d.type !== "doc-page") return;
+  if (courseMode !== "docs" || d.doc !== select.value) return;
+  hideDeckLoading();
+  current = {
+    lecture: select.value,
+    page: d.page,
+    title: d.title || "",
+    number: d.number,
+    index: d.index,
+  };
+});
 $("#chat-form").addEventListener("submit", (e) => {
   e.preventDefault();
   if (streaming) { streaming.ctl.abort(); return; }   // 流式期间这个键是「停止」
@@ -1158,12 +2028,14 @@ document.addEventListener("mousedown", (e) => {
 document.addEventListener("keydown", (e) => {
   if (e.key === "Escape" && !historyPop.hidden) closeHistory();
 });
-for (const t of document.querySelectorAll(".tab")) {
+for (const t of document.querySelectorAll(".tab[data-mode]")) {
   t.addEventListener("click", () => setMode(t.dataset.mode));
 }
 $("#btn-update").addEventListener("click", triggerUpdate);
 $("#btn-export").addEventListener("click", exportPdf);
 $("#btn-settings").addEventListener("click", openSettings);
+const btnHomeSettings = $("#btn-home-settings");
+if (btnHomeSettings) btnHomeSettings.addEventListener("click", openSettings);
 $("#btn-save").addEventListener("click", saveSettings);
 $("#btn-cancel").addEventListener("click", () => $("#settings-modal").close());
 $("#btn-wizard-open").addEventListener("click", () => { $("#settings-modal").close(); openWizard(); });
@@ -1273,13 +2145,33 @@ resizer.addEventListener("pointercancel", () => document.body.classList.remove("
 window.addEventListener("resize", () => applyChatWidth(chatW));
 
 setMode("ask");
+showView("home");
 loadPrefs();
 setInterval(ensureQuoteInjection, 600);
+setInterval(trackProgress, 1200);
 // 外壳重载后 .slide-frame 要等 viewer.js 跑完才建出来，光靠轮询会漏掉刚载入的头几百毫秒
 viewer.addEventListener("load", () => {
+  if (loadedDoc) {
+    // 资料阅读器的 load 只说明外壳 HTML 到了，第一页还在路上。等它 postMessage
+    // 报页（会提前收起遮罩）；万一读失败，900ms 后也必须把遮罩撤掉。
+    setTimeout(hideDeckLoading, 900);
+  } else {
+    hideDeckLoading();
+  }
+  syncViewerTheme();
   for (const t of [0, 200, 600]) setTimeout(ensureQuoteInjection, t);
 });
-loadCourse().then(async () => {
+// 焦点在外层（比如刚点过顶栏）时，方向键也转发给资料阅读器。输入框里的键不抢。
+document.addEventListener("keydown", (e) => {
+  if (courseMode !== "docs") return;
+  const t = e.target;
+  if (t && (/^(INPUT|TEXTAREA|SELECT)$/.test(t.tagName) || t.isContentEditable)) return;
+  if (!["ArrowLeft", "ArrowRight", "PageUp", "PageDown", "Home", "End", " "].includes(e.key)) return;
+  e.preventDefault();
+  try { viewer.contentWindow.postMessage({ type: "doc-key", key: e.key }, "*"); }
+  catch (err) { /* iframe 未就绪 */ }
+});
+loadCourses().then(async () => {
   // 启动时环境不齐就直接把向导摆出来（用户点过「不再提示」的缺失项不算）
   try {
     const w = await api("/api/wizard");
